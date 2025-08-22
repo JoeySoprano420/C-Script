@@ -238,3 +238,71 @@ Mapping: fully C-ABI compatible; drop in your C headers and code.
 
 Tool: a working v0.1 compiler above—extend it into your dream build.
 
+---
+
+Quick demo
+
+demo.csc
+
+@hardline on
+@opt max
+@profile on          // triggers PGO two-pass
+@out "demo.exe"
+
+enum! Color { Red=1, Green, Blue, }
+
+// Exhaustive switch OK:
+int score(Color c){
+    int s=0;
+    CS_SWITCH_EXHAUSTIVE(Color, c)
+        CS_CASE(Red):   s=10; break;
+        CS_CASE(Green): s=20; break;
+        CS_CASE(Blue):  s=30; break;
+    CS_SWITCH_END(Color, c)
+    return s;
+}
+
+// Softline fns (instrumented on first pass; hotness applied on second)
+fn inc(int x) -> int => x+1;
+fn triple(int x) -> int {
+    int r = x*3;
+    return r;
+}
+
+int main(void){
+    let int a = 7;      // lowers to: const int a = 7;
+    var int b = 9;      // lowers to: int b = 9;
+    @unsafe {
+        short s = a + 500000; // narrowed here (allowed only in @unsafe)
+        (void)s;
+    }
+    print("score(Blue)=%d; inc(40)=%d; triple(5)=%d\n", score(Blue), inc(40), triple(5));
+    return 0;
+}
+
+---
+
+Build & run
+
+SH:
+
+g++ -std=gnu++17 cscriptc.cpp -o cscriptc
+./cscriptc demo.csc
+./demo.exe
+
+---
+
+If you intentionally omit a CS_CASE(Blue) you’ll get a compile‑time error listing the missing case(s).
+
+With @profile on, you’ll see a quick instrumented build+run happen invisibly; then we rebuild and annotate the hottest softline fns with CS_HOT for the final optimized .exe.
+
+What you’ve got now
+
+Directive-first C with dual posture (hardline/softline), single‑artifact build, and baked‑in optimizations.
+
+Real compile‑time analysis for enum! switch coverage (no runtime hand‑waving).
+
+Self-contained PGO loop that doesn’t leak intermediates and meaningfully steers codegen via hot attributes.
+
+---
+
