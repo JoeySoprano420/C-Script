@@ -676,3 +676,617 @@ int main(int argc, char** argv){
     return 0;
 }
 
+// ============================================================================
+// ==============  EMBEDDED LLVM + LLD (in-process), no system CC  ============
+// ============================================================================
+// Drop this entire block at the *bottom* of cscriptc.cpp (v0.3). Then build:
+//   Linux/macOS (example; adjust LLVM version & libs):
+//     clang++ -std=c++17 cscriptc.cpp -o cscriptc \
+//       -DCS_EMBED_LLVM=1 \
+//       `llvm-config --cxxflags --ldflags --system-libs --libs all` \
+//       -lclangFrontend -lclangDriver -lclangCodeGen -lclangParse -lclangSema \
+//       -lclangSerialization -lclangAST -lclangLex -lclangBasic \
+//       -lclangToolingCore -lclangRewrite -lclangARCMigrate \
+//       -llldELF -llldCOFF -llldMachO -llldCommon
+//
+//   Windows (MSVC/Clang-CL; link against prebuilt LLVM/Clang/LLD .lib):
+//     /DCS_EMBED_LLVM=1 and add libs: lldCOFF.lib lldCommon.lib
+//     clangFrontend.lib clangDriver.lib clangCodeGen.lib ... (matching your LLVM)
+// ----------------------------------------------------------------------------
+
+#if defined(CS_EMBED_LLVM)
+
+#include <memory>
+#include <chrono>
+
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/WithColor.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/LangOptions.h"
+#include "clang/Basic/TargetInfo.h"
+#include "clang/CodeGen/CodeGenAction.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Frontend/FrontendActions.h"
+#include "clang/FrontendTool/Utils.h"
+#include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Serialization/PCHContainerOperations.h"
+
+#include "lld/Common/Driver.h"
+#include "lld/Common/Version.h"
+#include "lld/Common/Memory.h"
+#include "lld/COFF/Driver.h"
+#include "lld/ELF/Driver.h"
+#include "lld/MachO/Driver.h"
+
+// ---- Utility: ephemeral file (used only when a linker flavor demands a path)
+static std::string cs_write_temp_file(const std::string& base, llvm::StringRef data) {
+  std::string dir;
+#if defined(_WIN32)
+  char buf[MAX_PATH]; GetTempPathA(MAX_PATH, buf);
+  dir = std::string(buf);
+#else
+  const char* t = getenv("TMPDIR"); dir = t? t: "/tmp/";
+#endif
+  std::string path = dir + base;
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
+  if (ec) throw std::runtime_error("cannot create temp file: " + path);
+  os << data;
+  os.close();
+  return path;
+}
+
+static void cs_rm(const std::string& p) { std::remove(p.c_str()); }
+
+// ---- Map @opt to Clang codegen levels
+static void cs_apply_codegen_opts(clang::CodeGenOptions& CGO, const Config& cfg) {
+  if (cfg.opt=="O0") CGO.OptimizationLevel = 0;
+  else if (cfg.opt=="O1") CGO.OptimizationLevel = 1;
+  else if (cfg.opt=="O2") CGO.OptimizationLevel = 2;
+  else /*O3/max/size*/   CGO.OptimizationLevel = 3;
+}
+
+// ---- Build an in-memory Clang CompilerInstance that emits an object buffer
+static std::unique_ptr<llvm::MemoryBuffer>
+cs_compile_c_to_obj_inproc(const std::string& c_source,
+                           const Config& cfg,
+                           const std::vector<std::string>& incs,
+                           const std::vector<std::string>& defines) {
+  using namespace clang;
+  using namespace llvm;
+
+  // Initialize LLVM targets (once).
+  static bool inited = false;
+  if (!inited) {
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmParsers();
+    InitializeAllAsmPrinters();
+    inited = true;
+  }
+
+  auto DiagOpts = std::make_shared<DiagnosticOptions>();
+  auto DiagPrinter = std::make_unique<TextDiagnosticPrinter>(llvm::errs(), DiagOpts.get());
+  IntrusiveRefCntPtr<DiagnosticsEngine> Diags(
+      new DiagnosticsEngine(new DiagnosticIDs(), &*DiagOpts, DiagPrinter.release(), false));
+
+  CompilerInstance CI;
+  CI.createDiagnostics(DiagPrinter.release(), false);
+
+  auto Inv = std::make_shared<CompilerInvocation>();
+  // Language: C11
+  LangOptions &LO = Inv->getLangOpts();
+  LO.C11 = 1;
+  LO.C99 = 1;
+  LO.GNUMode = 1;
+
+  // Target triple: host
+  std::shared_ptr<clang::TargetOptions> TO = std::make_shared<clang::TargetOptions>();
+  TO->Triple = llvm::sys::getDefaultTargetTriple();
+  Inv->setTargetOpts(*TO);
+
+  // Header search / preprocessor
+  PreprocessorOptions &PP = Inv->getPreprocessorOpts();
+  for (auto& d : defines) PP.addMacroDef(d);
+  HeaderSearchOptions &HS = Inv->getHeaderSearchOpts();
+  for (auto& p : incs) HS.AddPath(p, frontend::Angled, false, false);
+
+  // CodeGen / Frontend
+  CodeGenOptions &CGO = Inv->getCodeGenOpts();
+  cs_apply_codegen_opts(CGO, cfg);
+  if (cfg.lto) {
+    CGO.EmitLLVMUsableTypeMetadata = 1;
+    // ThinLTO hooks could be enabled here, but we keep a straight obj flow.
+  }
+  Inv->getFrontendOpts().Inputs.clear();
+  Inv->getFrontendOpts().ProgramAction = frontend::EmitObj;
+  Inv->getFrontendOpts().Inputs.emplace_back("input.c", clang::Language::C);
+
+  // Filesystem: put the C source into an in-memory file "input.c"
+  auto InMemFS = llvm::vfs::InMemoryFileSystem::create();
+  auto MB = llvm::MemoryBuffer::getMemBufferCopy(llvm::StringRef(c_source), "input.c");
+  InMemFS->addFile("input.c", /*modtime*/ 0, std::move(MB));
+
+  auto OverlayFS = std::make_shared<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
+  OverlayFS->pushOverlay(std::move(InMemFS));
+
+  CI.setInvocation(std::move(Inv));
+  CI.createFileManager(OverlayFS);
+  CI.createSourceManager(CI.getFileManager());
+
+  const clang::FileEntry *FE = CI.getFileManager().getFile("input.c");
+  if (!FE) throw std::runtime_error("failed to map in-memory source as FileEntry");
+  CI.getSourceManager().setMainFileID(CI.getSourceManager().createFileID(FE, clang::SourceLocation(), clang::SrcMgr::C_User));
+
+  CI.createPreprocessor(clang::TU_Complete);
+  CI.createASTContext();
+
+  clang::EmitObjAction Act;
+  if (!CI.ExecuteAction(Act))
+    throw std::runtime_error("clang in-proc codegen failed");
+
+  // Grab the produced object as a MemoryBuffer
+#if CLANG_VERSION_MAJOR >= 15
+  std::unique_ptr<llvm::MemoryBuffer> Obj = Act.takeGeneratedObject();
+#else
+  // Fallback for older Clang (rare; adjust if needed):
+  std::unique_ptr<llvm::MemoryBuffer> Obj = Act.takeOutputFile(); // may differ by version
+#endif
+  if (!Obj) throw std::runtime_error("no object produced by clang action");
+
+  return Obj;
+}
+
+// ---- LLD link (ELF/COFF/Mach-O) in-process to a final .exe
+static int cs_link_with_lld(const Config& cfg,
+                            llvm::MemoryBufferRef objRef,
+                            const std::string& outPath) {
+  using namespace llvm;
+
+  // Some LLD flavors still expect file paths; write the object to a temp if needed.
+  // (Still no user-visible intermediates; we delete them.)
+  std::string tmpObj = cs_write_temp_file("cscript_lld_obj.o", objRef.getBuffer());
+  int rc = 1;
+
+#if defined(_WIN32)
+  // -------- COFF (Windows) --------
+  std::vector<const char*> args;
+  std::string outOpt = std::string("/OUT:") + outPath;
+  args.push_back("lld-link");
+  args.push_back(outOpt.c_str());
+  args.push_back(tmpObj.c_str());
+  // Subsystem + entry; mainCRTStartup will be found via default libs
+  args.push_back("/SUBSYSTEM:CONSOLE");
+  args.push_back("/ENTRY:mainCRTStartup");
+  // Library paths and libs from directives
+  std::vector<std::string> hold;
+  for (auto& lp : cfg.libpaths) { hold.push_back(std::string("/LIBPATH:") + lp); args.push_back(hold.back().c_str()); }
+  for (auto& l  : cfg.links)    {
+    std::string lib = l; if (lib.rfind(".lib")==std::string::npos) lib += ".lib";
+    hold.push_back(lib); args.push_back(hold.back().c_str());
+  }
+  // Default CRT if user didn't supply any
+  hold.push_back("/defaultlib:msvcrt");
+  args.push_back(hold.back().c_str());
+
+  // LLD COFF
+  if (lld::coff::link(args, /*canExitEarly*/ false, llvm::outs(), llvm::errs()))
+    rc = 0;
+
+#elif defined(__APPLE__)
+  // -------- Mach-O (macOS) --------
+  std::vector<const char*> args;
+  args.push_back("ld64.lld");
+  args.push_back("-o"); args.push_back(outPath.c_str());
+  args.push_back(tmpObj.c_str());
+  // lib paths & libs
+  std::vector<std::string> hold;
+  for (auto& lp : cfg.libpaths){ hold.push_back(std::string("-L")+lp); args.push_back(hold.back().c_str()); }
+  for (auto& l  : cfg.links)   { hold.push_back(std::string("-l")+l);  args.push_back(hold.back().c_str()); }
+  // System libs (libSystem)
+  args.push_back("-lSystem");
+  if (lld::macho::link(args, /*canExitEarly*/ false, llvm::outs(), llvm::errs()))
+    rc = 0;
+
+#else
+  // -------- ELF (Linux/*nix) --------
+  std::vector<const char*> args;
+  args.push_back("ld.lld");
+  args.push_back("-o"); args.push_back(outPath.c_str());
+  args.push_back(tmpObj.c_str());
+
+  // Add user-provided search paths and libs
+  std::vector<std::string> hold;
+  for (auto& lp : cfg.libpaths){ hold.push_back(std::string("-L")+lp); args.push_back(hold.back().c_str()); }
+  for (auto& l  : cfg.links)   { hold.push_back(std::string("-l")+l);  args.push_back(hold.back().c_str()); }
+
+  // Try to supply a dynamic linker and libc if none provided; best-effort defaults:
+  // You can always override via @libpath/@link to point at specific runtimes.
+  // Common dynamic linkers:
+  const char* dl_candidates[] = {
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/ld-linux-x86-64.so.2",
+    "/lib64/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-aarch64.so.1"
+  };
+  bool haveDL = false;
+  for (auto* d: dl_candidates){
+    if (llvm::sys::fs::exists(d)) {
+      args.push_back("--dynamic-linker");
+      args.push_back(d);
+      haveDL = true;
+      break;
+    }
+  }
+  // Pull in libc if user didn't supply anything:
+  hold.push_back("-lc"); args.push_back(hold.back().c_str());
+
+  if (lld::elf::link(args, /*canExitEarly*/ false, llvm::outs(), llvm::errs()))
+    rc = 0;
+#endif
+
+  cs_rm(tmpObj);
+  if (rc!=0) std::remove(outPath.c_str()); // ensure no half-baked output
+  return rc;
+}
+
+// ---- Public entry: Build once *entirely in-process* (replaces system CC path)
+static int build_once_llvm_inproc(const Config& cfg,
+                                  const std::string& c_src,
+                                  const std::string& outPath) {
+  // Gather include paths and defines from cfg
+  std::vector<std::string> incs = cfg.incs;
+  std::vector<std::string> defs = cfg.defines;
+  if (cfg.hardline) defs.push_back("CS_HARDLINE=1");
+  // (Profile define is *not* used in final pass.)
+
+  // Compile to obj (MemoryBuffer) with Clang front-end
+  auto ObjBuf = cs_compile_c_to_obj_inproc(c_src, cfg, incs, defs);
+
+  // Link with LLD flavor for host
+  int rc = cs_link_with_lld(cfg, ObjBuf->getMemBufferRef(), outPath);
+  if (rc!=0) {
+    llvm::WithColor::error(llvm::errs(), "lld") << "link failed for " << outPath << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+// ---- Wire it into your existing driver by overriding the builder:
+//      Find the lambda build_once(...) in v0.3 and *don’t delete it*.
+//      We just shadow the call sites below when CS_EMBED_LLVM is on.
+#undef  build_once   // avoid confusion with the earlier lambda if visible
+
+// Helper that mirrors the earlier signature & behavior
+static int cs_build_once_embed(const Config& cfg,
+                               const std::string& c_src,
+                               const std::string& outPath,
+                               bool /*profileDefineUnusedHere*/) {
+  try {
+    return build_once_llvm_inproc(cfg, c_src, outPath);
+  } catch (const std::exception& e) {
+    std::cerr << "embed-LLVM build error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
+// Finally, override the two places where v0.3 calls build_once():
+//  1) the instrumented pass (we still use the external pass there *only* if you desire).
+//     For a fully embedded flow, you could also emit an instrumented object here; to keep
+//     changes minimal, we’ll leave PGO’s first pass to the existing temp-CC path unless
+//     you define CS_PGO_EMBED as well.
+//  2) the final pass: we *always* use embedded LLVM+LLD.
+
+// To keep the rest of your file intact, add these two small shims:
+//  - put them near where build_once is defined/called, or leave here if your compiler
+//    allows referencing them (since we inline strings from above).
+
+// If you prefer to *force* embedded path for both passes, also define CS_PGO_EMBED=1.
+#ifdef CS_PGO_EMBED
+  #define CS_BUILD_ONCE_PROFILE(cfg, c_src, outTmp) cs_build_once_embed(cfg, c_src, outTmp, true)
+#else
+  // Fall back to your existing system-CC instrumented build for pass #1 (keeps PGO reliable
+  // across platforms with standard runtimes). This doesn’t affect the final exe path.
+  // If you want fully embedded instrumentation, signal me and I’ll wire an IR-level counter pass.
+  #define CS_BUILD_ONCE_PROFILE(cfg, c_src, outTmp) build_once(c_src, outTmp, /*defineProfile*/true)
+#endif
+
+#define CS_BUILD_ONCE_FINAL(cfg, c_src, outPath) cs_build_once_embed(cfg, c_src, outPath, false)
+
+#endif // CS_EMBED_LLVM
+
+// ============================================================================
+// ======  FULL IR-LEVEL COUNTER PASS (100% in-proc profiling, no toolchain) ==
+// ============================================================================
+// Build flags (example; adjust for your LLVM install):
+//   clang++ -std=c++17 cscriptc.cpp -o cscriptc \
+//     -DCS_EMBED_LLVM=1 -DCS_PGO_EMBED=1 \
+//     `llvm-config --cxxflags --ldflags --system-libs --libs all` \
+//     -lclangFrontend -lclangDriver -lclangCodeGen -lclangParse -lclangSema \
+//     -lclangSerialization -lclangAST -lclangLex -lclangBasic \
+//     -lclangToolingCore -lclangRewrite -lclangARCMigrate \
+//     -llldELF -llldCOFF -llldMachO -llldCommon
+//
+// Notes:
+//  - Instruments every defined function by inserting calls to `cs_prof_hit("<fn>")`
+//    directly in LLVM IR at function entry. Our prelude (guarded by CS_PROFILE_BUILD)
+//    already defines `cs_prof_hit` and a lightweight table+flush.
+//  - Pass implemented with the *new pass manager*; we also provide a manual fallback.
+//  - Final profile selection (hot set) + second pass are unchanged—only fully embedded now.
+
+#if defined(CS_EMBED_LLVM) && defined(CS_PGO_EMBED)
+
+#include <memory>
+#include <utility>
+
+#include "llvm/ADT/Triple.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
+#include "llvm/Support/WithColor.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Frontend/FrontendActions.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/LangOptions.h"
+#include "clang/Basic/TargetInfo.h"
+#include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Serialization/PCHContainerOperations.h"
+
+// ---- Compile C text to LLVM Module in-process (instead of straight object)
+static std::pair<std::unique_ptr<llvm::Module>, std::unique_ptr<llvm::LLVMContext>>
+cs_compile_c_to_module_inproc(const std::string& c_source,
+                              const Config& cfg,
+                              const std::vector<std::string>& incs,
+                              const std::vector<std::string>& defines) {
+  using namespace clang;
+  using namespace llvm;
+
+  static bool inited = false;
+  if (!inited) {
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmParsers();
+    InitializeAllAsmPrinters();
+    inited = true;
+  }
+
+  auto DiagOpts = std::make_shared<DiagnosticOptions>();
+  auto DiagPrinter = std::make_unique<TextDiagnosticPrinter>(llvm::errs(), DiagOpts.get());
+  IntrusiveRefCntPtr<DiagnosticsEngine> Diags(
+      new DiagnosticsEngine(new DiagnosticIDs(), &*DiagOpts, DiagPrinter.release(), false));
+
+  auto Ctx = std::make_unique<LLVMContext>();
+
+  CompilerInstance CI;
+  CI.createDiagnostics();
+
+  auto Inv = std::make_shared<CompilerInvocation>();
+  LangOptions &LO = Inv->getLangOpts();
+  LO.C11 = 1; LO.C99 = 1; LO.GNUMode = 1;
+
+  auto TO = std::make_shared<TargetOptions>();
+  TO->Triple = sys::getDefaultTargetTriple();
+  Inv->setTargetOpts(*TO);
+
+  PreprocessorOptions &PP = Inv->getPreprocessorOpts();
+  for (auto& d : defines) PP.addMacroDef(d);
+  HeaderSearchOptions &HS = Inv->getHeaderSearchOpts();
+  for (auto& p : incs) HS.AddPath(p, frontend::Angled, false, false);
+
+  Inv->getFrontendOpts().Inputs.clear();
+  Inv->getFrontendOpts().ProgramAction = frontend::EmitLLVMOnly;
+  Inv->getFrontendOpts().Inputs.emplace_back("input.c", clang::Language::C);
+
+  // Map source in-memory
+  auto InMemFS = llvm::vfs::InMemoryFileSystem::create();
+  auto MB = llvm::MemoryBuffer::getMemBufferCopy(StringRef(c_source), "input.c");
+  InMemFS->addFile("input.c", 0, std::move(MB));
+  auto OverlayFS = std::make_shared<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
+  OverlayFS->pushOverlay(std::move(InMemFS));
+
+  CI.setInvocation(std::move(Inv));
+  CI.createFileManager(OverlayFS);
+  CI.createSourceManager(CI.getFileManager());
+
+  const clang::FileEntry *FE = CI.getFileManager().getFile("input.c");
+  if (!FE) throw std::runtime_error("failed to map in-memory source as FileEntry");
+  CI.getSourceManager().setMainFileID(CI.getSourceManager().createFileID(FE, clang::SourceLocation(), clang::SrcMgr::C_User));
+  CI.createPreprocessor(clang::TU_Complete);
+  CI.createASTContext();
+
+  clang::EmitLLVMOnlyAction Act(Ctx.get());
+  if (!CI.ExecuteAction(Act))
+    throw std::runtime_error("clang IR generation failed");
+
+#if CLANG_VERSION_MAJOR >= 15
+  std::unique_ptr<llvm::Module> M = Act.takeModule();
+#else
+  std::unique_ptr<llvm::Module> M = Act.takeLLVMModule(); // older API
+#endif
+  if (!M) throw std::runtime_error("no LLVM module produced");
+
+  return { std::move(M), std::move(Ctx) };
+}
+
+// ---- IR-level profiling pass (new pass manager)
+struct CSProfilePass : llvm::PassInfoMixin<CSProfilePass> {
+  llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
+    using namespace llvm;
+    LLVMContext& C = M.getContext();
+
+    // Declare (or get) void cs_prof_hit(i8*)
+    FunctionCallee Hit = M.getOrInsertFunction(
+        "cs_prof_hit",
+        FunctionType::get(Type::getVoidTy(C), { Type::getInt8PtrTy(C) }, false));
+
+    size_t instrumented = 0;
+
+    for (Function& F : M) {
+      if (F.isDeclaration()) continue;
+      if (F.getName().startswith("llvm.")) continue; // skip intrinsics
+
+      BasicBlock& Entry = F.getEntryBlock();
+      IRBuilder<> B(&*Entry.getFirstInsertionPt());
+
+      // Build a global string for the function name
+      Value* Name = B.CreateGlobalStringPtr(F.getName(), "cs_fn_name");
+
+      // Insert the counter hit
+      B.CreateCall(Hit, { Name });
+      instrumented++;
+    }
+
+    // Ensure we also emit ctor to init/flush profiling if needed (prelude does atexit)
+    (void)instrumented;
+    return PreservedAnalyses::none();
+  }
+};
+
+// ---- Utility: run our pass + a standard O-level pipeline before codegen
+static void cs_run_ir_pipeline(llvm::Module& M, int optLevel) {
+  using namespace llvm;
+
+  PassBuilder PB;
+  LoopAnalysisManager     LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager    CGAM;
+  ModuleAnalysisManager   MAM;
+
+  // Register analysis managers
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  // Our instrumentation pass runs very early
+  ModulePassManager MPM;
+  MPM.addPass(CSProfilePass());
+
+  // Then a default optimization pipeline roughly matching -O{N}
+  OptimizationLevel O = OptimizationLevel::O2;
+  switch(optLevel){
+    case 0: O = OptimizationLevel::O0; break;
+    case 1: O = OptimizationLevel::O1; break;
+    case 2: O = OptimizationLevel::O2; break;
+    case 3: default: O = OptimizationLevel::O3; break;
+  }
+  MPM.addPass(PB.buildPerModuleDefaultPipeline(O));
+
+  MPM.run(M, MAM);
+}
+
+// ---- Emit an object file from an LLVM Module (in-memory)
+static std::unique_ptr<llvm::MemoryBuffer>
+cs_emit_obj_from_module(llvm::Module& M, const Config& cfg) {
+  using namespace llvm;
+
+  std::string Triple = sys::getDefaultTargetTriple();
+  M.setTargetTriple(Triple);
+
+  std::string Error;
+  const Target* T = TargetRegistry::lookupTarget(Triple, Error);
+  if(!T) throw std::runtime_error("Target lookup failed: " + Error);
+
+  TargetOptions Opts;
+  CodeGenOpt::Level CGO = CodeGenOpt::Default;
+  if      (cfg.opt=="O0") CGO = CodeGenOpt::None;
+  else if (cfg.opt=="O1") CGO = CodeGenOpt::Less;
+  else if (cfg.opt=="O2") CGO = CodeGenOpt::Default;
+  else                    CGO = CodeGenOpt::Aggressive;
+
+  std::unique_ptr<TargetMachine> TM(
+      T->createTargetMachine(Triple, "generic", "", Opts, std::nullopt, std::nullopt, CGO));
+  M.setDataLayout(TM->createDataLayout());
+
+  // Verify IR (useful while iterating)
+  if (verifyModule(M, &errs())) {
+    throw std::runtime_error("invalid LLVM module after instrumentation");
+  }
+
+  // Use legacy PM for codegen
+  legacy::PassManager PM;
+  SmallVector<char, 0> OBJ;
+  raw_svector_ostream OS(OBJ);
+
+  if (TM->addPassesToEmitFile(PM, OS, nullptr, CodeGenFileType::CGFT_ObjectFile)) {
+    throw std::runtime_error("TargetMachine cannot emit object file");
+  }
+  PM.run(M);
+
+  return std::make_unique<SmallVectorMemoryBuffer>(std::move(OBJ), "cscript_obj.o", false);
+}
+
+// ---- Build once (instrumented profiling pass) entirely in-proc
+static int cs_build_once_embed_profile_irpass(const Config& cfg,
+                                              const std::string& c_src,
+                                              const std::string& outTmpExecutable) {
+  try {
+    // Compose defines/includes (note: CS_PROFILE_BUILD ON here)
+    std::vector<std::string> incs = cfg.incs;
+    std::vector<std::string> defs = cfg.defines;
+    defs.push_back("CS_PROFILE_BUILD=1");
+    if (cfg.hardline) defs.push_back("CS_HARDLINE=1");
+
+    auto [Mod, Ctx] = cs_compile_c_to_module_inproc(c_src, cfg, incs, defs);
+
+    // Run our IR-level instrumentation and optimization
+    int oLvl = 2;
+    if      (cfg.opt=="O0") oLvl = 0;
+    else if (cfg.opt=="O1") oLvl = 1;
+    else if (cfg.opt=="O2") oLvl = 2;
+    else                    oLvl = 3;
+
+    cs_run_ir_pipeline(*Mod, oLvl);
+
+    // Emit object
+    auto ObjBuf = cs_emit_obj_from_module(*Mod, cfg);
+
+    // Link with LLD (reusing earlier helper)
+    int rc = cs_link_with_lld(cfg, ObjBuf->getMemBufferRef(), outTmpExecutable);
+    return rc;
+  } catch (const std::exception& e) {
+    std::cerr << "IR-pass profiling build error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
+// ---- Override the profiling build macro to use our IR pass path
+#undef CS_BUILD_ONCE_PROFILE
+#define CS_BUILD_ONCE_PROFILE(cfg, c_src, outTmp) \
+  cs_build_once_embed_profile_irpass(cfg, c_src, outTmp)
+
+// ---- Ensure the final pass (already embedded) remains as-is
+// (CS_BUILD_ONCE_FINAL already routes to cs_build_once_embed in the previous block.)
+
+#endif // CS_EMBED_LLVM && CS_PGO_EMBED
+
