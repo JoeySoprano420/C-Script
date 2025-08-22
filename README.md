@@ -84,8 +84,6 @@ Paper-cuts gone: fn, =>, let/var, print, simple defer.
 
 ---
 
-C:
-
 ---
 
 3) Optimizations (baked-in, zero-cost)
