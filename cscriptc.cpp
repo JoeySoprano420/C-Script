@@ -5824,3 +5824,371 @@ static int cs_rx_match(const char* re, const char* text) {
 		// end of cscript.cpp
 		// ============================ End of cscript.cpp ============================
 
+// ============================ Reflection + Bounds + Runtime Core Pack (append-only) ============================
+        namespace cs_runtime_core {
+
+            // Portable runtime core (time/sleep/cpu count, file I/O, entropy, panics)
+            static std::string prelude_runtime_addendum() {
+                return R"(
+/* --- Runtime Core Addendum --- */
+#ifndef CS_RUNTIME_CORE_INCLUDED
+#define CS_RUNTIME_CORE_INCLUDED 1
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#if defined(_WIN32)
+  #include <windows.h>
+  #include <io.h>
+  #include <sysinfoapi.h>
+  #include <bcrypt.h>
+  #pragma comment(lib, "bcrypt.lib")
+#else
+  #include <unistd.h>
+  #include <sys/stat.h>
+  #include <sys/time.h>
+  #include <fcntl.h>
+#endif
+
+/* Time */
+static uint64_t cs_rt_now_ns(void){
+#if defined(_WIN32)
+    LARGE_INTEGER f,c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (uint64_t)((1000000000.0 * (double)c.QuadPart) / (double)f.QuadPart);
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+static void cs_rt_sleep_ms(unsigned ms){
+#if defined(_WIN32)
+    Sleep(ms);
+#else
+    struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (long)(ms%1000)*1000000L; nanosleep(&ts, NULL);
+#endif
+}
+static int cs_rt_cpu_count(void){
+#if defined(_WIN32)
+    SYSTEM_INFO si; GetSystemInfo(&si); return (int)(si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1);
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN); return (int)(n>0?n:1);
+#endif
+}
+
+/* File I/O (read/write whole file) */
+static int cs_rt_read_file(const char* path, char** outData, size_t* outLen){
+    *outData = NULL; if (outLen) *outLen = 0;
+    FILE* f = fopen(path, "rb"); if(!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); if (sz < 0){ fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc((size_t)sz+1); if(!buf){ fclose(f); return 0; }
+    size_t n = fread(buf, 1, (size_t)sz, f); fclose(f);
+    buf[n] = 0; *outData = buf; if (outLen) *outLen = n; return 1;
+}
+static int cs_rt_write_file(const char* path, const void* data, size_t len){
+    FILE* f = fopen(path, "wb"); if(!f) return 0;
+    size_t n = fwrite(data, 1, len, f); fclose(f); return n==len;
+}
+
+/* Entropy */
+static int cs_rt_entropy(void* dst, size_t len){
+#if defined(_WIN32)
+    NTSTATUS st = BCryptGenRandom(NULL, (PUCHAR)dst, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return st==0;
+#else
+    #if defined(__linux__)
+      ssize_t r = getrandom(dst, len, 0); return r==(ssize_t)len;
+    #else
+      int fd = open("/dev/urandom", O_RDONLY); if (fd<0) return 0;
+      size_t got = 0; while (got < len){ ssize_t n = read(fd, (char*)dst+got, len-got); if (n<=0){ close(fd); return 0; } got += (size_t)n; }
+      close(fd); return 1;
+    #endif
+#endif
+}
+
+/* Panics */
+static void cs_panic(const char* msg){
+#if defined(CS_HARDLINE)
+    fprintf(stderr, "[panic] %s\n", msg?msg:"(null)"); fflush(stderr); abort();
+#else
+fprintf(stderr, "[panic-soft] %s\n", msg ? msg : "(null)"); fflush(stderr);
+#endif
+            }
+            static void cs_panicf(const char* fmt, ...) {
+                va_list ap; va_start(ap, fmt); fprintf(stderr, "[panic] "); vfprintf(stderr, fmt, ap); fprintf(stderr, "\n"); va_end(ap);
+#if defined(CS_HARDLINE)
+                abort();
+#endif
+            }
+
+#endif /* CS_RUNTIME_CORE_INCLUDED */
+                )";
+        }
+
+} // namespace cs_runtime_core
+
+// ---------------------------- Hidden bounds + panics (with DSL lowerings) ----------------------------
+namespace cs_bounds {
+
+    static bool scan_bounds_directive(const std::string& src) {
+        std::istringstream ss(src); std::string line;
+        while (std::getline(ss, line)) {
+            std::string t = line; size_t a = t.find_first_not_of(" \t\r\n"); if (a == std::string::npos) continue;
+            size_t b = t.find_last_not_of(" \t\r\n"); t = t.substr(a, b - a + 1);
+            if (t.rfind("@bounds", 0) == 0) { std::istringstream ls(t.substr(8)); std::string v; ls >> v; return v != "off"; }
+        }
+        return false;
+    }
+
+    static std::string prelude_bounds_addendum() {
+        return R"(
+/* --- Bounds & Panic Addendum --- */
+#ifndef CS_BOUNDS_INCLUDED
+#define CS_BOUNDS_INCLUDED 1
+#ifndef CS_COUNT_OF
+  #if defined(_MSC_VER)
+    #define CS_COUNT_OF(a) _countof(a)
+  #else
+    #define CS_COUNT_OF(a) (sizeof(a)/sizeof((a)[0]))
+  #endif
+#endif
+
+static void cs_bounds_panic(const char* arr, const char* idx, size_t limit){
+    char msg[256];
+    snprintf(msg, sizeof(msg), "index out of bounds: %s[%s] (limit=%zu)", arr ? arr : "?", idx ? idx : "?", (size_t)limit);
+    cs_panic(msg);
+    }
+
+    /* GCC/Clang array detection; MSVC falls back to _countof for real arrays */
+#if defined(__clang__) || defined(__GNUC__)
+#define __CS_IS_ARRAY(a) (!__builtin_types_compatible_p(__typeof__(a), __typeof__(&(a)[0])))
+#else
+#define __CS_IS_ARRAY(a) 1 /* best-effort */
+#endif
+
+#define CS_IDX_AUTO(a,i) \
+    ( (( __CS_IS_ARRAY(a) && ((size_t)(i) >= CS_COUNT_OF(a)) ) ) ? \
+        (cs_bounds_panic(#a,#i,(size_t)CS_COUNT_OF(a)), (a)[(i)]) : (a)[(i)] )
+
+#define CS_CHECK(cond) do{ if(!(cond)){ cs_panicf("check failed: %s at %s:%d", #cond, __FILE__, __LINE__); } }while(0)
+#define CS_PANIC(msg)  do{ cs_panic(msg); }while(0)
+
+#endif /* CS_BOUNDS_INCLUDED */
+        )";
+}
+
+// DSL lowerings (idx!, panic!, check!, and optional hidden [ ] wrapping)
+static std::string apply_lowerings(const std::string& src, bool enableHidden) {
+    using namespace cs_regex_wrap;
+    std::string s = src, out; out.reserve(s.size());
+
+    // idx!(a, i) -> CS_IDX_AUTO(a,i)
+    {
+        std::regex re(R"(idx!\s*\(\s*([\s\S]*?)\s*,\s*([\s\S]*?)\s*\))", std::regex::ECMAScript);
+        cmatch m; size_t pos = 0;
+        while (search_from(s, pos, m, re)) {
+            append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+            out += "CS_IDX_AUTO((" + m[1].str() + "),(" + m[2].str() + "))";
+        }
+        out.append(s, pos, std::string::npos); s.swap(out); out.clear(); out.reserve(s.size());
+    }
+    // panic!("msg") -> CS_PANIC("msg")
+    {
+        std::regex re(R"(panic!\s*\(\s*\"([\s\S]*?)\"\s*\))", std::regex::ECMAScript);
+        cmatch m; size_t pos = 0;
+        while (search_from(s, pos, m, re)) {
+            append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+            out += "CS_PANIC(\"" + m[1].str() + "\")";
+        }
+        out.append(s, pos, std::string::npos); s.swap(out); out.clear(); out.reserve(s.size());
+    }
+    // check!(cond) -> CS_CHECK(cond)
+    {
+        std::regex re(R"(check!\s*\(\s*([\s\S]*?)\s*\))", std::regex::ECMAScript);
+        cmatch m; size_t pos = 0;
+        while (search_from(s, pos, m, re)) {
+            append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+            out += "CS_CHECK(" + m[1].str() + ")";
+        }
+        out.append(s, pos, std::string::npos); s.swap(out); out.clear(); out.reserve(s.size());
+    }
+    // Optional hidden rewrite: ident[expr] -> CS_IDX_AUTO(ident, expr)
+    if (enableHidden) {
+        // Heuristic: identifier '[' ... ']' not immediately preceded by 'sizeof' or '#' or in a declaration.
+        // Conservatively avoid matches with 'struct', 'typedef', 'enum', 'return'.
+        std::regex re(R"((?<!sizeof\s|\#|\bstruct\b|\btypedef\b|\benum\b|\breturn\b)\b([A-Za-z_]\w*)\s*\[\s*([\s\S]*?)\s*\])", std::regex::ECMAScript);
+        s = std::regex_replace(s, re, "CS_IDX_AUTO($1, $2)");
+    }
+    return s;
+}
+
+} // namespace cs_bounds
+
+// ---------------------------- Complete runtime reflection (types, fields, functions) ----------------------------
+namespace cs_reflect {
+
+    struct Field { std::string type, name; };
+    struct Struct { std::string name; std::vector<Field> fields; };
+    struct EnumRec { std::string name; std::vector<std::string> members; };
+    struct FuncRec { std::string name, args, ret; };
+
+    static std::string trim(std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n"); if (a == std::string::npos) return "";
+        size_t b = s.find_last_not_of(" \t\r\n"); return s.substr(a, b - a + 1);
+    }
+
+    static void scan(const std::string& src, std::vector<Struct>& structs, std::vector<EnumRec>& enums, std::vector<FuncRec>& funcs) {
+        using namespace cs_regex_wrap;
+        // struct! Name { fields; }
+        {
+            std::regex re(R"(struct!\s+([A-Za-z_]\w*)\s*\{([\s\S]*?)\})", std::regex::ECMAScript);
+            cmatch m; size_t pos = 0;
+            while (search_from(src, pos, m, re)) {
+                Struct S; S.name = trim(m[1].str());
+                std::istringstream ss(m[2].str()); std::string line;
+                while (std::getline(ss, line, ';')) {
+                    line = trim(line); if (line.empty()) continue;
+                    // split "Type name" (best-effort, supports '*', '[]')
+                    size_t sp = line.find_last_of(" \t");
+                    if (sp == std::string::npos) continue;
+                    Field f; f.type = trim(line.substr(0, sp)); f.name = trim(line.substr(sp + 1));
+                    if (!f.name.empty() && !f.type.empty()) S.fields.push_back(std::move(f));
+                }
+                structs.push_back(std::move(S));
+            }
+        }
+        // enum! Name { A=..., B, C, ... }
+        {
+            std::regex re(R"(enum!\s+([A-Za-z_]\w*)\s*\{([\s\S]*?)\})", std::regex::ECMAScript);
+            cmatch m; size_t pos = 0;
+            while (search_from(src, pos, m, re)) {
+                EnumRec E; E.name = trim(m[1].str());
+                std::string body = m[2].str(); std::string tok; std::istringstream ss(body);
+                while (std::getline(ss, tok, ',')) {
+                    std::string t = trim(tok); if (t.empty()) continue;
+                    size_t eq = t.find('='); if (eq != std::string::npos) t = trim(t.substr(0, eq));
+                    E.members.push_back(t);
+                }
+                enums.push_back(std::move(E));
+            }
+        }
+        // fn name(args) -> ret
+        {
+            std::regex r1(R"(\bfn\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*->\s*([^\{\n;]+)\s*\{)", std::regex::ECMAScript);
+            std::regex r2(R"(\bfn\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*->\s*([^\n;]+)\s*=>)", std::regex::ECMAScript);
+            for (auto& r : { r1, r2 }) {
+                cmatch m; size_t pos = 0;
+                while (cs_regex_wrap::search_from(src, pos, m, r)) {
+                    FuncRec F; F.name = trim(m[1].str()); F.args = trim(m[2].str()); F.ret = trim(m[3].str());
+                    funcs.push_back(std::move(F));
+                }
+            }
+        }
+    }
+
+    // C prelude for reflection types and API
+    static std::string prelude_reflect_addendum() {
+        return R"(
+/* --- Reflection Addendum --- */
+#ifndef CS_REFLECT_INCLUDED
+#define CS_REFLECT_INCLUDED 1
+#include <stddef.h>
+typedef struct { const char* name; const char* type; size_t offset; } CS_FieldInfo;
+typedef struct { const char* name; const CS_FieldInfo* fields; unsigned field_count; size_t size; size_t align; } CS_TypeInfo;
+typedef struct { const char* name; const char* ret; const char* args; } CS_FuncInfo;
+typedef struct { const char* name; const char* const* members; unsigned count; } CS_EnumInfo;
+
+/* Extern registries emitted below */
+extern const CS_TypeInfo cs_types[];
+extern const unsigned    cs_types_count;
+extern const CS_FuncInfo cs_funcs[];
+extern const unsigned    cs_funcs_count;
+extern const CS_EnumInfo cs_enums[];
+extern const unsigned    cs_enums_count;
+
+/* Lookup helpers */
+static const CS_TypeInfo* cs_type_find(const char* name){
+    for (unsigned i=0;i<cs_types_count;i++){ if (strcmp(cs_types[i].name,name)==0) return &cs_types[i]; }
+    return NULL;
+}
+static const CS_FuncInfo* cs_func_find(const char* name){
+    for (unsigned i=0;i<cs_funcs_count;i++){ if (strcmp(cs_funcs[i].name,name)==0) return &cs_funcs[i]; }
+    return NULL;
+}
+static const CS_EnumInfo* cs_enum_find(const char* name){
+    for (unsigned i=0;i<cs_enums_count;i++){ if (strcmp(cs_enums[i].name,name)==0) return &cs_enums[i]; }
+    return NULL;
+}
+#endif /* CS_REFLECT_INCLUDED */
+)";
+    }
+
+    // Emit reflection registries. Must be appended AFTER types/functions are lowered into C.
+    static std::string emit_from_source(const std::string& srcAll, bool echo = false) {
+        std::vector<Struct> structs; std::vector<EnumRec> enums; std::vector<FuncRec> funcs;
+        scan(srcAll, structs, enums, funcs);
+
+        std::ostringstream o;
+        o << prelude_reflect_addendum();
+
+        // Emit enum member static arrays
+        for (auto& e : enums) {
+            o << "static const char* const cs_enum_" << e.name << "_members[] = {";
+            for (size_t i = 0; i < e.members.size(); ++i) { o << "\"" << e.members[i] << "\""; if (i + 1 < e.members.size()) o << ","; }
+            o << "};\n";
+        }
+
+        // Emit fields arrays with offsetof(Type, field)
+        for (auto& s : structs) {
+            o << "static const CS_FieldInfo cs_fields_" << s.name << "[] = {";
+            if (!s.fields.empty()) o << "\n";
+            for (size_t i = 0; i < s.fields.size(); ++i) {
+                const Field& f = s.fields[i];
+                o << "  { \"" << f.name << "\", \"" << f.type << "\", offsetof(" << s.name << ", " << f.name << ") }";
+                if (i + 1 < s.fields.size()) o << ",";
+                o << "\n";
+            }
+            o << "};\n";
+        }
+
+        // Emit type table with sizeof/alignof
+        o << "static const CS_TypeInfo cs_types[] = {\n";
+        for (auto& s : structs) {
+            o << "  { \"" << s.name << "\", cs_fields_" << s.name << ", (unsigned)(sizeof(cs_fields_" << s.name << ")/sizeof(cs_fields_" << s.name << "[0])), sizeof(" << s.name << "), ";
+#if defined(_MSC_VER)
+            o << "__alignof(" << s.name << ")";
+#else
+            o << "_Alignof(" << s.name << ")";
+#endif
+            o << " },\n";
+        }
+        o << "};\n";
+        o << "static const unsigned cs_types_count = (unsigned)(sizeof(cs_types)/sizeof(cs_types[0]));\n";
+
+        // Emit funcs
+        o << "static const CS_FuncInfo cs_funcs[] = {\n";
+        for (auto& f : funcs) {
+            // signature strings kept as-is (portable)
+            o << "  { \"" << f.name << "\", \"" << f.ret << "\", \"" << f.args << "\" },\n";
+        }
+        o << "};\n";
+        o << "static const unsigned cs_funcs_count = (unsigned)(sizeof(cs_funcs)/sizeof(cs_funcs[0]));\n";
+
+        // Emit enums table
+        o << "static const CS_EnumInfo cs_enums[] = {\n";
+        for (auto& e : enums) {
+            o << "  { \"" << e.name << "\", cs_enum_" << e.name << "_members, (unsigned)(sizeof(cs_enum_" << e.name << "_members)/sizeof(cs_enum_" << e.name << "_members[0])) },\n";
+        }
+        o << "};\n";
+        o << "static const unsigned cs_enums_count = (unsigned)(sizeof(cs_enums)/sizeof(cs_enums[0]));\n";
+
+        if (echo) {
+            std::cerr << "[reflect] structs=" << structs.size() << " enums=" << enums.size() << " funcs=" << funcs.size() << "\n";
+        }
+        return o.str();
+    }
+
+} // namespace cs_reflect
+
