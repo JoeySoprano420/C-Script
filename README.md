@@ -832,3 +832,424 @@ C-Script 1.0 is a compact language with a **directive brain** and a **C soul**: 
 
 ---
 
+# C-Script 1.0 — Unified Language Reference (Grammar • Syntax • Semantics)
+
+This is a single, self-contained specification of the C-Script language and its compiler toolchain as of the “Monolith” design described in the public repo. It consolidates the *language model*, *surface syntax & sugars*, *directives*, *compilation semantics*, and a practical EBNF-style grammar for the subset that extends C. C-Script is a directive-driven derivative of C with two complementary modes:
+
+* **Hard-line:** strict, UB-averse posture and aggressive diagnostics.
+* **Soft-line:** expressive sugars that lower to plain C/LLVM with zero runtime cost. ([GitHub][1])
+
+C-Script produces **a single native executable** (no visible `.o`, `.ll`, `.asm` outputs) via an **IR-aware** front-end and late optimization/link in process. All valid C (ANSI/ISO, C11 default) is valid C-Script; you can paste it unchanged. ([GitHub][1])
+
+---
+
+## 0) Language Model & Goals
+
+* **Directive paradigm.** Lines beginning with `@` (typically at the top) control build, target, linking, and semantic modes. They are processed before lowering. ([GitHub][1])
+* **Dual posture.** Hard-line enforces strict types, integer/pointer conversions, aliasing, boundary guarantees, and exhaustiveness; soft-line offers sugars like `fn`, `let`, `=>`, `enum!`, etc., all lowering to C without cost. ([GitHub][1])
+* **Single-artifact output** with **AOT semantic analysis before IR**, and an **embedded link** step. ([GitHub][1])
+* **Self-contained PGO.** When profiling is enabled, the compiler performs an instrumented build+run, then rebuilds and marks hottest soft-line functions as hot for the final exe. ([GitHub][1])
+* **Direct C mapping.** ABI/layout/widths match host C; headers are used directly; interop is seamless; C-Script additions expand to ordinary C constructs. ([GitHub][1])
+
+---
+
+## 1) Files, CLI, and Build Model
+
+### 1.1 Source Files
+
+* **Extension:** `.csc`
+* **Content:** Directives (`@...`) followed by ordinary C plus soft-line sugar.
+* **Mapping:** Any legal C construct is accepted verbatim. Sugars lower to C/LLVM during compile. ([GitHub][1])
+
+### 1.2 Command Line
+
+```
+cscriptc [options] file.csc
+```
+
+**Notable options** (override in-file directives):
+`-o <file.exe>` (override `@out`) · `-O{0|1|2|3|max|size}` (override `@opt`) · `--no-lto` (disable `@lto`) · `--strict` (enable hard-line + treat pedantic warnings as errors) · `--relaxed` (softer diagnostics) · `--cc <clang|gcc|cl>` (prefer backend toolchain even though the driver hides intermediates) · `--show-c` (dump generated C). ([GitHub][1])
+
+---
+
+## 2) Directives (Declarative Build & Semantics)
+
+Directives begin with `@` and are processed top-down prior to lowering. They typically appear before the first non-comment token. **Scope**: from the line they appear until overridden. ([GitHub][1])
+
+### 2.1 Build / Output
+
+* `@out "prog.exe"` — output file name.
+* `@opt O0|O1|O2|O3|max|size` — optimization level; `max` enables a full inliner+vectorizer pipeline.
+* `@lto on|off` — Whole-program ThinLTO when appropriate.
+* `@target "triple"` — target triple; default is host.
+* `@abi "sysv"|"msvc"` — calling convention set.
+* `@cc feature(+sse4.2, +crc32)` — CPU features for multiversioning. ([GitHub][1])
+
+### 2.2 Linking / Search Paths
+
+* `@link "z"` / `@link "pthread"` — add a library.
+* `@libpath "/opt/mylibs"` — add library search directory.
+* `@inc "/path/include"` — add header search path.
+* `@define NAME=VALUE` — predefine a macro visible to the C backend as well.
+* `@include <stdio.h>` / `@include "foo.h"` — convenience header passthrough. ([GitHub][1])
+
+### 2.3 Modes / Multi-file
+
+* `@hardline on|off` (default off); `@softline on|off` (default on).
+* `@profile off|on|auto` — `auto`: instrument→run if possible→rebuild hot.
+* `@unit "name"` — label the translation unit.
+* `@use "other.csc"` — import additional C-Script files into the same single-exe build. ([GitHub][1])
+
+> **Design note:** The README presents hard/soft toggles, optimization/LTO controls, library paths, ABI/target, and a profiling mode that drives hot-path re-emission for the final exe. ([GitHub][1])
+
+---
+
+## 3) Soft-Line Surface (Zero-Cost Sugars)
+
+These are syntax conveniences that lower to ordinary C during compile (no runtime overhead). Unless stated otherwise, the semantics are identical to the expanded C.
+
+### 3.1 Functions
+
+**Single-expression form**:
+
+```
+fn Name (param-list) -> RetType => expr ;
+```
+
+Lowers to:
+
+```
+static inline RetType Name(param-list) { return (expr); }
+```
+
+**Block form**:
+
+```
+fn Name (param-list) -> RetType { /* body */ }
+```
+
+Lowers to:
+
+```
+RetType Name(param-list) { /* body */ }
+```
+
+These are explicitly stated sugars in the README’s language model. ([GitHub][1])
+
+### 3.2 Variable Declarations
+
+* `let T id = expr;` → `const T id = expr;`
+* `var T id = expr;` → `T id = expr;`
+  Also valid without initializer when C allows. ([GitHub][1])
+
+### 3.3 Prelude Convenience
+
+* `print(...)` → macro alias to `printf(...)` (no overhead).
+* Optional `defer` macro (for-scope trick).
+* `likely(x) / unlikely(x)` hint macros. ([GitHub][1])
+
+### 3.4 `enum!` Macro + Exhaustive Switch
+
+```
+enum! Color { Red, Green, Blue }
+```
+
+Expands to an ordinary C `enum` plus helper data for hard-line **switch exhaustiveness** checking when used with the provided macro pattern; compile-time errors list missing cases if you intentionally omit one. ([GitHub][1])
+
+---
+
+## 4) Hard-Line Semantics (Diagnostics & Guarantees)
+
+When hard-line is enabled (via directive or `--strict`), the compiler aims to surface errors **before** codegen and to reject UB-adjacent constructs. Highlights:
+
+* No implicit narrowing or signed/unsigned surprise conversions; promotions must be explicit.
+* Constexpr-checkable array indexes are verified against static bounds.
+* Pointer arithmetic forbids mixing unrelated provenance unless wrapped in an explicit unsafe region.
+* Switch exhaustiveness is enforced for `enum!`-declared enums.
+* UB-adjacent operations (e.g., shift by width or more, divide by known zero, out-of-range enum values) become errors.
+* Obvious lifetime escapes in static scope (e.g., returning address of a local) are diagnosed. ([GitHub][1])
+
+> The project’s stated goal is to surface type/lifetime/provenance/range errors at compile time, *prior* to IR emission, and to surface link-time failures as compile diagnostics thanks to the inline linker. ([GitHub][1])
+
+---
+
+## 5) Profiles, Hotness, and Codegen
+
+With profiling enabled, C-Script runs a quick instrumented build+run, collects counts, and **rebuilds** the program marking **hottest soft-line functions** as hot (e.g., via a target-appropriate “hot” attribute), improving final code layout and inlining. This loop is self-contained—no leaking intermediates. ([GitHub][1])
+
+---
+
+## 6) Types, Interop, and Data Layout
+
+* **Primitives:** all C scalars (`char`, `short`, `int`, `long`, `long long`, fixed-width `int32_t`/friends, `float`, `double`, and C’s `_Bool` visible as `bool`).
+* **Derived:** pointers `*T`, arrays `T[n]`, function pointers, structs, unions, enums, and bitfields—all matching C’s ABI/layout on the host toolchain.
+* **Attributes:** e.g., `@packed struct ...`, `@aligned(64) struct ...` for layout control.
+* **Interop:** include and call C directly; C code can call into C-Script with the same ABI. ([GitHub][1])
+
+> The “C-Script ⇄ C mapping highlights” section emphasizes identical ABI/layout/widths, direct header usage, and zero-shim interop. ([GitHub][1])
+
+---
+
+## 7) Mini-Standard Prelude (Zero-Cost)
+
+C-Script ships a tiny prelude providing `print`, `defer`, and `likely/unlikely` hints as simple macros, intentionally avoiding a heavy runtime. ([GitHub][1])
+
+---
+
+## 8) Formal Grammar (EBNF-style Additions Over C)
+
+> **Scope.** This grammar specifies the C-Script extensions and sugars on top of standard C11. Where a non-terminal delegates to C, the C11 grammar applies unchanged. A C-Script **translation unit** is a sequence of directives and ordinary C external declarations, plus the forms listed below. ([GitHub][1])
+
+**Lexical**
+C-Script uses C’s lexical structure (identifiers, literals, comments). The `@` prefix introduces **directives**.
+
+```
+letter        ::= 'A'..'Z' | 'a'..'z' | '_'
+digit         ::= '0'..'9'
+ident         ::= letter { letter | digit }*
+string        ::= ...       // as in C
+integer       ::= ...       // as in C
+newline       ::= '\n' | '\r\n'
+```
+
+**Top Level** ([GitHub][1])
+
+```
+translation-unit
+  ::= { directive | external-decl }+ ;
+
+directive
+  ::= '@' ident directive-tail? newline ;
+
+directive-tail
+  ::= tokens…           // parsed according to §2 (out/opt/lto/etc.)
+
+external-decl
+  ::= function-def
+   |  declaration
+   |  typedef
+   |  preprocessor
+   |  softline-fn ;
+```
+
+**Soft-line Function** ([GitHub][1])
+
+```
+softline-fn
+  ::= 'fn' ident '(' param-list? ')' '->' type ( '=>' expr ';' | compound-stmt ) ;
+
+param-list
+  ::= param { ',' param }* ;
+
+param
+  ::= type ident ;
+
+type
+  ::= C-type-token-seq… ;   // use C’s type grammar
+```
+
+**Variable Declarations (Sugar)**
+
+```
+declaration
+  ::= 'let' type ident ( '=' initializer )? ';'
+   |  'var' type ident ( '=' initializer )? ';'
+   |  c-declaration ;                 // any other C declaration
+```
+
+**Enum Macro (Soft-line)**
+
+```
+enum-macro
+  ::= 'enum!' ident '{' enumerator-list '}' ;
+
+enumerator-list
+  ::= enumerator { ',' enumerator }* ;
+
+enumerator
+  ::= ident [ '=' constant-expr ]? ;   // as in C enum
+```
+
+**Exhaustive Switch Helper (Usage Pattern)**
+C-Script expects a macro pattern (provided by the prelude) to check exhaustiveness for enums defined via `enum!`. Conceptually:
+
+```
+switch-exhaustive
+  ::= 'CS_SWITCH_EXHAUSTIVE' '(' EnumType ',' expr ')' '{'
+         { 'CS_CASE' '(' enumerator ')' ':' statement-seq }*
+      'CS_SWITCH_END' '(' EnumType ',' expr ')' ';' ;
+```
+
+If any enumerator is missing, **compile-time error** lists exactly which are missing. ([GitHub][1])
+
+**Directives** (token forms)
+The following schematic forms are accepted (see §2 for meaning): ([GitHub][1])
+
+```
+'@out' string
+'@opt' ('O0'|'O1'|'O2'|'O3'|'max'|'size')
+'@lto' ('on'|'off')
+'@target' string
+'@abi' ('sysv'|'msvc')
+'@link' string
+'@libpath' string
+'@inc' string
+'@define' ident ['=' tokens…]
+'@include' ('<' hdr '>' | '"' hdr '"')
+'@profile' ('off'|'on'|'auto')
+'@unit' string
+'@use' string
+'@hardline' ('on'|'off')
+'@softline' ('on'|'off')
+```
+
+**Everything else** (expressions, statements, operators, precedence, preprocessing) follows **C11**. Any C code compiles as-is. ([GitHub][1])
+
+---
+
+## 9) Semantics of Lowering
+
+* **`fn` single-expr** → `static inline` function returning `(expr)`.
+* **`fn` block** → ordinary C function of the given return type.
+* **`let`** → `const` introduction; **`var`** → plain C definition.
+* **`enum!`** → expands to a C `enum` plus data enabling hard-line exhaustiveness checks.
+* **Prelude** provides `print`, `defer`, `likely/unlikely` as macros.
+* **No runtime tax:** lowering targets idiomatic C so the optimizer can erase abstraction cost. ([GitHub][1])
+
+---
+
+## 10) Examples
+
+### 10.1 Hello
+
+```c
+@out "hello.exe"
+@opt O3
+@lto on
+@hardline on
+
+fn main(argc:int, argv:**char) -> int {
+    print("Hello, world! argc=%d\n", argc);
+    return 0;
+}
+```
+
+A single optimized `hello.exe` is produced; intermediates are kept in memory or temp and removed. ([GitHub][1])
+
+### 10.2 Enum + Exhaustive Switch
+
+```c
+enum! Color { Red, Green, Blue }
+
+fn describe(c: Color) -> void {
+    CS_SWITCH_EXHAUSTIVE(Color, c) {
+        CS_CASE(Red):   print("red\n");
+        CS_CASE(Green): print("green\n");
+        CS_CASE(Blue):  print("blue\n");
+    } CS_SWITCH_END(Color, c);
+}
+```
+
+Omit a case and the compiler emits a **compile-time error** naming the missing enumerator(s). ([GitHub][1])
+
+### 10.3 Profiling to Steer Codegen
+
+```c
+@profile auto
+
+fn hotpath(x:int) -> int => x * x + 3;
+
+fn main() -> int {
+    for (int i=0; i<1<<20; ++i) hotpath(i);
+    return 0;
+}
+```
+
+The compiler instruments, runs once, and rebuilds with `hotpath` marked as hot in the final exe. ([GitHub][1])
+
+---
+
+## 11) Conformance, Portability, and Interop
+
+* **ABI/layout/widths:** identical to your host C toolchain (C11 default).
+* **Headers:** use your system headers directly.
+* **FFI:** calling between C and C-Script needs no shims.
+* **Libraries:** `@link`/`@libpath` map to target-appropriate options (e.g., `-lX` vs `X.lib`). ([GitHub][1])
+
+---
+
+## 12) Error Model & Diagnostics (Hard-Line)
+
+* Integer narrowing, signed/unsigned mixups, out-of-range enums, UB-adjacent shifts/divides: **errors**.
+* Array bounds (when constexpr-resolvable): **errors** on out-of-bounds.
+* Pointer provenance: mixing unrelated provenance: **error** unless in an explicit unsafe region (hard-line).
+* Switches over `enum!`: missing cases → **compile-time error** with the missing set.
+* Link failures are surfaced as **compile diagnostics** thanks to the inline linker. ([GitHub][1])
+
+---
+
+## 13) “C-Script ⇄ C” Mapping Cheat Sheet
+
+* **Everything C** is valid in C-Script.
+* **Sugars** (`fn`, `let`, `var`, `=>`, `enum!`) expand to plain C before IR.
+* **Preludes** are macros, *not* runtime helpers.
+* **Interop** is immediate—identical ABI, includes, and calling conventions. ([GitHub][1])
+
+---
+
+## 14) Extended Topics (From the Monolith Overview)
+
+The Monolith README outlines additional forward-looking conveniences (e.g., slices/views, simple monomorphized templates) that still lower to plain C structs and functions, paying only for used instantiations. These patterns are described as zero-cost helpers and remain compatible with the overarching goals above. ([GitHub][1])
+
+---
+
+### Appendix A — Minimal Extended Grammar Block
+
+This summarizes §8 in compact form:
+
+```
+translation-unit := { directive | external-decl }+ ;
+directive        := '@' ident [tokens…] NEWLINE ;
+
+softline-fn := 'fn' ident '(' param-list? ')' '->' type
+               ( '=>' expr ';' | compound-stmt ) ;
+
+declaration := ('let'|'var') type ident ('=' initializer)? ';'
+             | c-declaration ;
+
+enum-macro  := 'enum!' ident '{' enumerator-list '}' ;
+```
+
+All other expressions/statements/types/preprocessing are per C11.
+
+---
+
+### Appendix B — Canonical Examples of Directive Usage
+
+```
+@out "prog.exe"
+@opt O3
+@lto on
+@abi "sysv"
+@inc "/opt/include"
+@libpath "/opt/lib"
+@link "m"
+@hardline on
+@profile auto
+```
+
+These correspond one-to-one to the CLI’s override flags. ([GitHub][1])
+
+---
+
+## 15) Final Notes
+
+C-Script is “directive-first C with dual posture, single-artifact build, and baked-in optimizations,” featuring real compile-time analysis for `enum!` switch coverage and a self-contained PGO loop to steer codegen. That’s the intended 1.0 experience per the Monolith README. ([GitHub][1])
+
+---
+
+### Sources
+
+The above is synthesized directly from the project README and its “Monolith” sections (language model, grammar, directives, mapping, diagnostics, CLI, and examples). Where behavior is compiler/driver-specific (profiling rebuilds, inline linker), we followed the repo’s descriptions. ([GitHub][1])
+
+
