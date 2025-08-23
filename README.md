@@ -306,3 +306,529 @@ Self-contained PGO loop that doesn’t leak intermediates and meaningfully steer
 
 ---
 
+# C-Script 1.0 — The Monolith
+
+*Low-level authority, through high-level scripting.*
+
+This is the **complete, unified overview** of the *final* C-Script language and toolchain—what ships at 1.0. It reads as a spec, cookbook, and operator’s manual in one. You can start from here and build kernels, firmware, servers, games, and little tools, all with the same **one-file → one .exe** experience.
+
+---
+
+## 0) North Star
+
+* **Directive paradigm.** Files are “programs + build files” in one. Lines starting with `@` steer compilation, linking, target, and memory semantics.
+* **Hard-line / Soft-line duality.**
+
+  * **Hard-line**: enforce strict types, integer/pointer conversions, aliasing, and boundary guarantees; maximize diagnostics; UB-averse lowering.
+  * **Soft-line**: expressive syntax sugar (`fn`, `let`, `=>`, `enum!`, etc.), macro-like templates—*zero-cost* lowering to C/LLVM constructs.
+* **Exactly one output**: a native **`.exe`** (or platform equivalent). No `.o`, `.ll`, `.asm` left behind. Intermediates live in memory or temp and are destroyed.
+* **AOT + IR-aware** front-end: semantic resolution, analysis, and aggressive optimizations **before** emitting LLVM IR.
+* **IR-embedded PGO**: profile in process (no external toolchain), rebuild hot paths, and multi-version where useful.
+* **JIT register policy**: the produced exe embeds *function multi-versions* using alternative regalloc/alloca and inlining strategies; startup and/or on-device sampling selects the best variant. No runtime JIT of user code; just **adaptive dispatch** among prebuilt variants.
+* **Direct C mapping**: every legal C construct has a stable mapping; the C ABI is the default FFI; headers are welcomed.
+* **Non-toxic boilerplate**: modern conveniences that compress classic C verbosity **without cost**.
+
+---
+
+## 1) File Model & Tooling
+
+A C-Script source file is a UTF-8 text program with **inline build directives**:
+
+```c
+// hello.csc
+
+@out "hello.exe"
+@opt O3
+@lto on
+@hardline on
+@profile auto         // off|on|auto; auto instruments, runs once (if runnable), rebuilds hot
+
+@link "m"             // -lm / libm
+@inc  "deps/include"  // add header search path
+@define FOO=1
+
+fn main(argc:int, argv: **char) -> int {
+    print("Hello, world! argc=%d\n", argc);
+    return 0;
+}
+```
+
+### 1.1 Directives (declarative, per-file or scoped)
+
+Directives are processed top-down before lowering. The common set:
+
+* **Build/Output**
+
+  * `@out "prog.exe"` – output file name.
+  * `@opt O0|O1|O2|O3|max|size` – optimization level; `max` implies full inliner+vectorizer pipeline.
+  * `@lto on|off` – ThinLTO whole-program when appropriate.
+  * `@target "x86_64-pc-windows-msvc"` – default is host triple.
+  * `@abi "sysv"| "msvc"` – choose calling convention set.
+  * `@cc feature(+sse4.2, +crc32)` – CPU feature hints for multiversioning.
+* **Linking**
+
+  * `@link "z"` `@link "pthread"` – add libs.
+  * `@libpath "/opt/mylibs"` – search paths.
+  * `@inc "/path/include"` – header search paths.
+* **Preprocessing / Globals**
+
+  * `@define NAME=VALUE` – predefine a macro visible to hardline C as well.
+  * `@include <stdio.h>` or `@include "foo.h"` – sugar for passing headers through.
+* **Modes**
+
+  * `@hardline on|off` – toggle strict mode (see §4).
+  * `@softline on|off` – toggle sugars (§2).
+  * `@profile off|on|auto` – IR-embedded profiling pass; `auto` runs once, then rebuilds hot.
+  * `@regjit on|off` – emit/disable register-policy multiversioning.
+  * `@sanitize address|undefined|thread` – dev-only sanitizers (not default); preserved as build-only.
+* **Packaging**
+
+  * `@unit "driver"` – label the current translation unit.
+  * `@use "other.csc"` – import additional C-Script files into the build (single-exe link).
+
+**Scope note:** Directives apply from the line they appear until overridden. Use them at top of file for clarity.
+
+---
+
+## 2) Soft-line Language
+
+Soft-line is the pleasant layer. It lowers *exactly* to C/LLVM equivalents with no runtime overhead.
+
+### 2.1 Functions
+
+**Expression-bodied:**
+
+```c
+fn add(a:int, b:int) -> int => a + b;
+
+fn tri(n:int) -> int => n*(n+1)/2;
+```
+
+**Block form:**
+
+```c
+fn clamp(x:int, lo:int, hi:int) -> int {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+```
+
+**Attributes (compile-time only):**
+
+* `@hot`, `@cold`, `@inline`, `@noinline`, `@flatten`, `@unroll(n)`, `@likely`, `@unlikely`.
+
+```c
+@hot @inline
+fn dot3(a:*float, b:*float) -> float {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+```
+
+### 2.2 Bindings
+
+```c
+let pi = 3.1415926535;   // lowers to `const` where possible
+var i  = 0;              // lowers to a normal local (no 'auto' storage penalty)
+```
+
+**Type inference** is local and *constant-folded*, but everything lowers to explicit C types before IR.
+
+### 2.3 `enum!` (exhaustive, zero-cost)
+
+```c
+enum! Color { Red, Green, Blue }
+
+fn paint(c:Color) -> void {
+    switch!(c) {
+        case Red:   print("R\n");
+        case Green: print("G\n");
+        case Blue:  print("B\n");
+    }
+}
+```
+
+* `enum!` generates a `typedef enum` and hidden validity helpers.
+* `switch!` is **compile-time exhaustive**; missing cases are a hard error under hard-line.
+
+### 2.4 Slices, Views, and Small Generics
+
+C-Script gives you **zero-cost views** that lower to plain structs (pointer + length) with inliner-friendly helpers.
+
+```c
+// Built-ins
+type view[T] = struct { T* ptr; size_t len; };
+
+// Sugar constructors
+fn view_of[T](p:*T, n:size_t) -> view[T] => (view[T]){ p, n };
+
+fn sum(v:view[int]) -> long {
+    var s: long = 0;
+    for (var i=0; i<(long)v.len; ++i) s += v.ptr[i];
+    return s;
+}
+```
+
+No hidden bounds checks; if `@hardline on`, analyzers warn on non-dominated bounds guards.
+
+### 2.5 Defer & Scope Guards
+
+```c
+fn copy(src: *char, dst: *char, n:size_t) -> void {
+    var f = fopen("log.txt", "a");
+    defer { if (f) fclose(f); }      // lowers to a no-alloc for/defer pattern
+
+    memcpy(dst, src, n);
+}
+```
+
+### 2.6 `@unsafe` Aisle
+
+```c
+@unsafe {
+    var p = (int*)0xDEADBEEF;    // ok inside; flagged if it escapes scope (hard-line check)
+    *p = 42;
+}
+```
+
+`@unsafe` is a *fenced* region: warnings suppressed for a curated set (casts, aliasing, volatile juggling). Outside of it, hard-line rules apply.
+
+---
+
+## 3) Hard-line Semantics (When the gloves go on)
+
+Turned on by `@hardline on` or `--strict`. It is still C—just the nicest, safest corner of it.
+
+* **Conversions**: no silent narrowing (e.g., `long -> int`) without explicit cast; signed/unsigned mixes warn/error.
+* **Pointers**:
+
+  * disallow arithmetic that leaves the object or array bounds without a dominating guard;
+  * flag casts between unrelated pointer types (except via `uintptr_t` in `@unsafe`).
+* **Aliasing**: `@noalias` parameter attribute enforces TBAA-friendly lowering.
+* **Init**: all locals must be definitely assigned before use.
+* **Enums**: `switch!` must be exhaustive.
+* **`fallthrough`** requires `@fallthrough` annotation to avoid accidental slips.
+* **Atomics**: only via `@atomic` intrinsics or C11 `<stdatomic.h>`; mixed plain/atomic is a diagnostic.
+* **Undefined behavior**: analyzer surfaces common UB shapes (shift overflow, div zero, out-of-range enum, trap reps) as compile errors whenever provable.
+
+---
+
+## 4) Types, Declarations, and Interop
+
+### 4.1 Primitive & Derived
+
+* All C scalar types are present: `char`, `short`, `int`, `long`, `long long`, fixed-width `int32_t` etc., `float`, `double`, `_Bool` as `bool`.
+* Pointers `*T`, arrays `T[n]`, function pointers `fnptr` (exact C signatures), structs/unions, enums.
+
+### 4.2 Structs/Unions/Bitfields
+
+C-Script mirrors C layout. Attributes:
+
+```c
+@packed struct Header { u16 kind; u32 len; }
+@aligned(64) struct Line { float x,y; float m,b; }
+```
+
+### 4.3 FFI (C ABI by default)
+
+Include headers and call functions directly:
+
+```c
+@include <stdio.h>
+@link "m"
+
+extern fn cos(double) -> double;   // optional; usually pulled via @include
+```
+
+Or wrap with **extern blocks**:
+
+```c
+extern @header("<time.h>") {
+    fn clock() -> long;
+}
+```
+
+---
+
+## 5) Control Flow & Expressions
+
+* `if`, `switch`, `while`, `do/while`, `for` lower to the identical C forms.
+* `switch!` is the exhaustive variant; plain `switch` behaves like C.
+* `guard` sugar (optional): `guard (cond) {return err;}` lowers to `if(!(cond)) { … }`.
+
+---
+
+## 6) Compile-time Facilities
+
+### 6.1 `static_assert`, `constexpr`, and `meta`
+
+* `static_assert(expr, "msg")` as in C11.
+* **Const-eval** expressions fold aggressively.
+* **`meta` evaluates at compile time** and splices results (like a hygienic macro) into the lowered C:
+
+```c
+meta {
+    // computed constants, tables
+    let LUT = gen_sine_table(1024);
+}
+```
+
+(Internally this is a front-end phase—not C++ template metaprogramming—so it’s fast and predictable.)
+
+### 6.2 Templates (Monomorphized Helpers)
+
+C-Script provides **parametric helpers** that become concrete C at emit time:
+
+```c
+template swap[T](a:*T, b:*T) -> void {
+    let t = *a; *a = *b; *b = t;
+}
+
+fn demo() -> void {
+    var x=1, y=2;
+    swap[int](&x, &y);
+}
+```
+
+Monomorphization is **AOT**; you pay only for used instantiations.
+
+---
+
+## 7) Concurrency & Atomics
+
+* **Threads**: `spawn` is portable sugar that lowers to pthreads/WinThreads.
+
+```c
+fn worker(arg:*void) -> *void { /* ... */ return null; }
+var t = spawn worker(null);   // returns a join handle
+join t;                       // lowers to pthread_join / WaitForSingleObject
+```
+
+* **Channels (opt-in)**: `chan[T]` lowers to a small lock+ring buffer implementation when used; header-only, inlined.
+
+* **Atomics**: `atomic_load`, `atomic_store`, `atomic_fetch_add` map to C11 atomics, with memory orders as enums.
+
+---
+
+## 8) Diagnostics & Errors (AOT)
+
+**All resolvable errors are compile-time.** The front end performs:
+
+* Symbol and type resolution with full range checks and conversion audits.
+* Enum exhaustiveness proofs.
+* Bound dominance checks in hard-line mode.
+* UB shape checks (provable ones).
+* Cross-TU link sanity (missing symbol, ABI mismatch) **before emitting IR**.
+
+Errors are printed with **file\:line\:col**, code snippet, and a suggested fix when simple.
+
+---
+
+## 9) Optimizations
+
+**Zero-cost by default**: sugar erases, IR is clean.
+
+* **Constant folding, DCE, SCCP, mem2reg, instcombine.**
+* **Loop opts**: unroll heuristic + `@unroll(n)` override; vectorizer when profitable.
+* **Tail calls, inlining** driven by profile/hints.
+* **Peepholes** from front-end (e.g., immediate forms).
+* **Wholetime**: if `@lto on`, cross-unit inlining and de-virt (where applicable).
+* **Code layout** guided by PGO.
+
+---
+
+## 10) Profile-Guided Build (fully in-proc)
+
+* `@profile on|auto` instruments **at IR level**: every defined `fn` gets a lightweight `cs_prof_hit("name")`.
+* The driver runs the instrumented exe (if `auto` and runnable), collects counts, selects top hot functions, and **rebuilds** with:
+
+  * `@hot` attributes,
+  * larger inline budgets,
+  * optional **function multi-versioning** (different register pressure/inlining/regalloc tradeoffs),
+  * code layout optimized for fall-through.
+
+No external profraw/profdata or compiler subprocess is required.
+
+---
+
+## 11) JIT Register Policy (without a JIT)
+
+The final exe can embed **N variants** of a hot function (e.g., *reg-tight*, *spill-resistant*, *vector-happy*). At program start (or after a brief warm-up, depending on `@regjit` policy), a tiny selector:
+
+1. Detects CPU features (ISA, core counts, L1/L2 sizes).
+2. Samples a few calls or consults persisted profile.
+3. Patches the dispatch table (an indirect jump or PLT-style thunk) to the best variant.
+
+**No runtime IR/JIT**—just **static variants** plus a 1-hop indirection resolved once.
+
+---
+
+## 12) Memory Semantics
+
+* `@noalias` on function parameters promises independent object lifetimes (lowers to TBAA-friendly attributes).
+* `@restrict` (C99 semantics) recognized and preserved.
+* `@aligned(N)`, `@assume_aligned(N)`, `@likely`, `@unlikely`.
+* Stack allocation is plain C; optional `@stack(nbytes)` hints large frames to static allocation arenas on freestanding targets.
+* **Lifetime notes**: The analyzer warns on escaping stack addresses, double-frees (provable), and use-after-free patterns when detectable.
+
+---
+
+## 13) Packaging, Modules, and C/C++ Integration
+
+### 13.1 Multi-file
+
+```c
+// driver.csc
+@unit "driver"
+@use  "math.csc"
+@out "app.exe"
+
+fn main(...) -> int { return run(); }
+```
+
+```c
+// math.csc
+@unit "math"
+fn run() -> int { return 0; }
+```
+
+All `@use`d units compile into the **same .exe**. The front-end guarantees consistent ABI and attribute merging before IR.
+
+### 13.2 Headers
+
+* `@include` lines are forwarded to the C surface as `#include` with managed search paths.
+* C++ headers are allowed behind `@cpp on` blocks; you control mangling with `extern "C"` declarations. (C-Script itself is C-ABI by default.)
+
+---
+
+## 14) Standard Prelude (Always Available)
+
+* `print` → `printf`
+* `defer` scope guard
+* `likely`/`unlikely`
+* Small helpers for `view[T]`, `min`, `max`, `swap[T]`
+* Exhaustive switch helpers behind `switch!`
+
+Everything is *header-sized* and compiled into your TU; nothing dynamic or hidden.
+
+---
+
+## 15) Examples
+
+### 15.1 Exhaustive control with hard-line
+
+```c
+@hardline on
+
+enum! Mode { Idle, Scan, Fire }
+
+fn step(m:Mode) -> void {
+    switch!(m) {
+        case Idle: print("idle\n");
+        case Scan: print("scan\n");
+        case Fire: print("fire\n");
+    }
+}
+```
+
+If you forget a case, the compiler errors out before IR emission.
+
+### 15.2 Views and fast loops
+
+```c
+fn saxpy(a:float, x:view[float], y:view[float]) -> void {
+    // hard-line will warn unless len guards dominate the loop
+    if (x.len != y.len) return;
+
+    for (var i=0; i<(long)x.len; ++i) {
+        y.ptr[i] = a*x.ptr[i] + y.ptr[i];
+    }
+}
+```
+
+`view[T]` lowers to `{T*, size_t}` and gets vectorized at `-O3`.
+
+### 15.3 Inline linking and feature flags
+
+```c
+@link "pthread"
+@cc feature(+sse4.2, +popcnt)
+@regjit on
+@profile auto
+@opt max
+```
+
+The build produces one optimized `.exe` with hot function multi-versioning and PGO-driven layout.
+
+---
+
+## 16) Command-line UX (mirrors directives)
+
+```
+cscriptc myprog.csc \
+  --out app.exe \
+  -O3 --lto \
+  --profile=auto \
+  --hardline \
+  --link z --link pthread \
+  --inc deps/include --libpath /opt/mylibs
+```
+
+CLI flags and `@` directives are merged; CLI wins when both are given.
+
+---
+
+## 17) Targets & Runtimes
+
+* **Hosted**: Windows (COFF/MSVC ABI), Linux (ELF/SysV), macOS (Mach-O).
+* **Freestanding**: Bare-metal targets can be selected with `@target` + `@abi`, and you provide start files via `@link`/`@libpath`. The driver still emits a single image.
+
+---
+
+## 18) Guarantees
+
+* **Performance**: sugar erases; IR is equivalent (or better) than hand-written C at the same flags.
+* **Stability**: Direct C mapping is normative—any C header is welcome; the ABI does not drift.
+* **Composability**: one TU or many, still one exe.
+* **Diagnostics first**: if the tool can prove a mistake, you hear about it **before** IR exists.
+
+---
+
+## 19) What’s Not in the Language
+
+* No GC, no exceptions, no implicit heap.
+* No runtime reflection (compile-time `meta` only).
+* No hidden bounds checks or panics; your guards are yours.
+* No mandatory runtime; the prelude is tiny and visible.
+
+---
+
+## 20) Quick Reference (Cheatsheet)
+
+* **Sugar**
+
+  * `fn name(args) -> ret => expr;`
+  * `fn name(args) -> ret { ... }`
+  * `let x = ...;` (const) · `var x = ...;` (mutable)
+  * `enum! Name { A, B, C }` with `switch!(value){ case A: ... }`
+  * `defer { ... }`
+  * `@unsafe { ... }`
+* **Directives**
+
+  * Build: `@out`, `@opt`, `@lto`, `@target`, `@abi`
+  * Profile: `@profile`, `@regjit`
+  * Link: `@link`, `@libpath`, `@inc`, `@include`
+  * Modes: `@hardline`, `@softline`, `@sanitize`
+  * Units: `@unit`, `@use`
+* **Attrs**
+
+  * `@hot`, `@cold`, `@inline`, `@noinline`, `@unroll(n)`, `@packed`, `@aligned(n)`, `@noalias`, `@restrict`
+
+---
+
+## 21) Closing
+
+C-Script 1.0 is a compact language with a **directive brain** and a **C soul**: the fastest way to write serious systems code that still reads like a script. You keep the metal **and** the ergonomics. The compiler does the orchestration—AOT semantics, IR-aware optimization, **in-proc** profiling, and a single clean artifact on disk.
+
+---
+
