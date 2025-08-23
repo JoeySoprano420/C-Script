@@ -425,3 +425,67 @@ Sources
 
 ⸻
 
+Here’s the canonical Hello World in C-Script using its softline fn sugar:
+
+// hello.csc
+
+// optional directive for output file
+@out "hello.exe"
+
+// define a softline function
+fn main() -> int {
+    print("Hello, world!\n");
+    return 0;
+}
+
+Notes:
+	•	fn main() -> int { … } is lowered to a normal C int main(void) with body intact.
+	•	print(...) is defined in the C-Script prelude as an alias for printf.
+	•	The @out directive tells the compiler to name the output executable hello.exe (optional; without it you’d get a.exe by default).
+
+⸻
+
+✅ To build:
+
+cscriptc hello.csc
+
+✅ To run:
+
+./hello.exe
+
+
+⸻
+
+Here’s what your hello.csc lowers to in plain C.
+
+Semantically equivalent minimal C (what the final exe effectively is)
+
+// --- generated from hello.csc (prelude elided for brevity) ---
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello, world!\n");
+    return 0;
+}
+
+“Faithful” lowering with the tiny bit of prelude it uses
+
+The compiler always prepends a small prelude; for this example only the print alias matters:
+
+// --- generated C (abridged prelude + lowered body) ---
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+// prelude alias used by the source
+#define print(...) printf(__VA_ARGS__)
+
+// softline header lowering:  fn main() -> int { ... }
+int main(void) {
+    print("Hello, world!\n");
+    return 0;
+}
+
+That’s it—the fn … -> … {} header is rewritten to a normal C signature, and print is just printf. Instrumentation/PGO and other prelude helpers are not emitted in the final optimized pass unless you enable them (e.g., @profile on).
