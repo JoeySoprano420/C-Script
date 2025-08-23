@@ -6869,3 +6869,423 @@ static int cs_rt_random_bytes(void* buf, size_t len) {
         }
 
     } // namespace cs_asmpack
+
+// ============================ Ritual-Safe Build Pack (append-only) ============================
+    namespace cs_ritual {
+
+        struct ExtraCli {
+            bool dump_ir = false;      // --dump-ir (embed-LLVM path preferred)
+            bool emit_obj = false;     // --emit-obj
+            bool relaxed_cleanup = false; // --relaxed
+            bool show_c = false;       // --show-c (echo lowered C for each pass)
+        };
+
+        // ------------- CI TMPDIR normalization -------------
+        static void ensure_tmpdir_for_ci() {
+#if defined(_WIN32)
+            auto setenv_kv = [](const char* k, const char* v) { SetEnvironmentVariableA(k, v); };
+            char buf[MAX_PATH]; GetTempPathA(MAX_PATH, buf);
+            const std::string sysTmp = buf;
+#else
+            auto setenv_kv = [](const char* k, const char* v) { setenv(k, v, 1); };
+            const std::string sysTmp = "/tmp/";
+#endif
+            auto is_true = [](const char* v)->bool {
+                if (!v) return false;
+                std::string s(v); for (auto& c : s) c = (char)tolower((unsigned char)c);
+                return s == "1" || s == "true" || s == "yes" || s == "on";
+                };
+#if defined(_WIN32)
+            char* ci = nullptr; size_t len = 0;
+            _dupenv_s(&ci, &len, "CI");
+            const bool on = is_true(ci); if (ci) free(ci);
+#else
+            const bool on = is_true(std::getenv("CI")) || is_true(std::getenv("GITHUB_ACTIONS"));
+#endif
+            if (on) {
+                setenv_kv("TMPDIR", sysTmp.c_str());
+#if defined(_WIN32)
+                // Align common variants
+                setenv_kv("TEMP", sysTmp.c_str());
+                setenv_kv("TMP", sysTmp.c_str());
+#endif
+            }
+        }
+
+        // ------------- @use imports and @unit manifest -------------
+        static std::string trim(std::string s) {
+            size_t a = s.find_first_not_of(" \t\r\n"); if (a == std::string::npos) return "";
+            size_t b = s.find_last_not_of(" \t\r\n");  return s.substr(a, b - a + 1);
+        }
+
+        // Expand lines: @use "file.csc" -> inject file contents in-place (one level, conservative).
+        static std::string apply_use_includes(const std::string& src, bool echo = false) {
+            std::istringstream ss(src);
+            std::ostringstream out;
+            std::string line;
+            while (std::getline(ss, line)) {
+                std::string t = trim(line);
+                if (t.rfind("@use", 0) == 0) {
+                    std::istringstream ls(t.substr(4));
+                    std::string path;
+                    if (ls.peek() == '"' || ls.peek() == '\'') ls >> std::quoted(path); else ls >> path;
+                    try {
+                        out << read_file(path);
+                        if (echo) std::cerr << "[ritual] used: " << path << "\n";
+                    }
+                    catch (...) {
+                        std::cerr << "[ritual] warning: @use failed for " << path << "\n";
+                    }
+                    continue;
+                }
+                out << line << "\n";
+            }
+            return out.str();
+        }
+
+        static std::string unit_manifest_template() {
+            return
+                R"(@unit
+# C-Script Ritual Manifest (template)
+@hardline on
+@softline on
+@opt O2
+@lto on
+@profile auto
+@time on
+# Imports (shared config)
+# @use "base.csc"
+
+# Architecture / Vectorization (optional)
+# @arch x64
+# @vecwidth 256
+# @fastmath off
+
+# Bounds / Safety
+@bounds on
+# @warn relaxed
+
+# Graphics/DB/etc. (optional)
+# @graphics software
+# @opencl off
+)";
+        }
+
+        // ------------- Profile auto and warn relaxed scans -------------
+        static bool scan_profile_auto(const std::string& src) {
+            std::istringstream ss(src); std::string line;
+            while (std::getline(ss, line)) {
+                std::string t = trim(line);
+                if (t.rfind("@profile", 0) == 0) {
+                    std::istringstream ls(t.substr(9));
+                    std::string v; ls >> v;
+                    return v != "off"; // 'auto' or 'on' -> true
+                }
+            }
+            return false;
+        }
+        static bool scan_warn_relaxed(const std::string& src) {
+            std::istringstream ss(src); std::string line;
+            while (std::getline(ss, line)) {
+                std::string t = trim(line);
+                if (t.rfind("@warn", 0) == 0) {
+                    std::istringstream ls(t.substr(5));
+                    std::string v; ls >> v;
+                    return v == "relaxed";
+                }
+            }
+            return false;
+        }
+
+        // ------------- Exhaustiveness relaxed prelude -------------
+        static std::string prelude_exhaustive_relaxed() {
+            return R"(
+/* --- Exhaustiveness (relaxed) macros --- */
+#ifndef CS_EXHAUSTIVE_RELAXED_INCLUDED
+#define CS_EXHAUSTIVE_RELAXED_INCLUDED 1
+#define CS_SWITCH_EXHAUSTIVE_RELAXED(T, expr) do { int __cs_hit=0; T __cs_v=(expr); switch(__cs_v){
+#define CS_CASE_R(x) case x: __cs_hit=1
+#define CS_SWITCH_RELAXED_END(T, expr) default: break; } do{ (void)__cs_hit; \
+    if (!cs__enum_is_valid_##T((int)__cs_v)) { fprintf(stderr, "[warn] non-exhaustive switch (" #T ") value=%d at %s:%d\n", (int)__cs_v, __FILE__, __LINE__); } \
+} while(0); } while(0)
+#endif
+)";
+        }
+
+        // ------------- Exhaustiveness checker that can warn instead of exit -------------
+        static int check_exhaustiveness_relaxed(const std::string& src,
+            const std::map<std::string, EnumInfo>& enums,
+            bool relaxed) {
+            // Reuse the existing pattern in check_exhaustiveness_or_die, but warn when relaxed.
+            size_t i = 0, n = src.size();
+            int errs = 0;
+            while (true) {
+                size_t a = src.find("CS_SWITCH_EXHAUSTIVE(", i);
+                if (a == std::string::npos) break;
+                size_t tstart = a + strlen("CS_SWITCH_EXHAUSTIVE(");
+                size_t p = tstart; while (p < n && isspace((unsigned char)src[p])) ++p;
+                size_t q = p; while (q < n && (isalnum((unsigned char)src[q]) || src[q] == '_')) ++q;
+                std::string Type = src.substr(p, q - p);
+                if (Type.empty()) { i = a + 1; continue; }
+                std::string endKey = std::string("CS_SWITCH_END(") + Type;
+                size_t b = src.find(endKey, q);
+                if (b == std::string::npos) {
+                    auto lc = line_col_at(src, a);
+                    std::cerr << (relaxed ? "[warn]" : "error:") << " unmatched CS_SWITCH_EXHAUSTIVE for '" << Type
+                        << "' at " << lc.first << ":" << lc.second << "\n";
+                    if (!relaxed) return 1; else { i = a + 1; continue; }
+                }
+                std::string region = src.substr(a, b - a);
+                std::regex caseRe(R"(CS_CASE\s*\(\s*([A-Za-z_]\w*)\s*\))");
+                cs_regex_wrap::cmatch m; std::set<std::string> seen; size_t pos2 = 0;
+                while (cs_regex_wrap::search_from(region, pos2, m, caseRe)) { seen.insert(m[1].str()); }
+                auto itE = enums.find(Type);
+                if (itE != enums.end()) {
+                    const auto& universe = itE->second.members;
+                    std::vector<std::string> missing; for (const auto& e : universe) if (!seen.count(e)) missing.push_back(e);
+                    if (!missing.empty()) {
+                        auto lc = line_col_at(src, a);
+                        if (relaxed) {
+                            std::cerr << "[warn] non-exhaustive switch for enum '" << Type << "' at "
+                                << lc.first << ":" << lc.second << " missing:";
+                            for (auto& mname : missing) std::cerr << " " << mname;
+                            std::cerr << "\n";
+                        }
+                        else {
+                            std::cerr << "error: non-exhaustive switch for enum '" << Type << "' at "
+                                << lc.first << ":" << lc.second << " missing:";
+                            for (auto& mname : missing) std::cerr << " " << mname;
+                            std::cerr << "\n"; return 1;
+                        }
+                    }
+                }
+                i = b + 1;
+            }
+            return errs;
+        }
+
+        // ------------- CLI helpers (parse and build command variants) -------------
+        static ExtraCli parse_extra_cli(const std::vector<std::string>& argv) {
+            ExtraCli e{};
+            for (size_t i = 0; i < argv.size(); ++i) {
+                const std::string& a = argv[i];
+                if (a == "--dump-ir") e.dump_ir = true;
+                else if (a == "--emit-obj") e.emit_obj = true;
+                else if (a == "--relaxed") e.relaxed_cleanup = true;
+                else if (a == "--show-c") e.show_c = true;
+            }
+            return e;
+        }
+
+        static std::string build_cmd_emit_obj(const Config& cfg, const std::string& cc, const std::string& cpath, const std::string& objOut) {
+            std::vector<std::string> cmd; cmd.push_back(cc);
+            bool msvc = (cc == "cl" || cc == "clang-cl");
+            auto add = [&](const std::string& s) { cmd.push_back(s); };
+            if (msvc) {
+                add("/nologo");
+                if (cfg.opt == "O0") add("/Od"); else if (cfg.opt == "O1") add("/O1"); else add("/O2");
+                if (cfg.lto) add("/GL");
+                if (cfg.hardline || cfg.strict) { add("/Wall"); add("/WX"); }
+                if (cfg.hardline) add("/DCS_HARDLINE=1");
+                for (auto& d : cfg.defines) add("/D" + d);
+                for (auto& p : cfg.incs)    add("/I" + p);
+                add("/c");      // compile only
+                add(cpath);
+                add("/Fo:" + objOut);
+            }
+            else {
+                add("-std=c11");
+                if (cfg.opt == "O0") add("-O0");
+                else if (cfg.opt == "O1") add("-O1");
+                else if (cfg.opt == "O2") add("-O2");
+                else if (cfg.opt == "O3") add("-O3");
+                else if (cfg.opt == "size") add("-Os");
+                if (cfg.lto) add("-flto");
+                if (cfg.hardline) { add("-Wall"); add("-Wextra"); add("-Werror"); add("-Wconversion"); add("-Wsign-conversion"); add("-DCS_HARDLINE=1"); }
+                for (auto& d : cfg.defines) add("-D" + d);
+                for (auto& p : cfg.incs)    add("-I" + p);
+                add("-c"); add(cpath);
+                add("-o"); add(objOut);
+            }
+            std::string full;
+            for (size_t i = 0; i < cmd.size(); ++i) { if (i) full.push_back(' '); bool q = cmd[i].find(' ') != std::string::npos; if (q) full.push_back('"'); full += cmd[i]; if (q) full.push_back('"'); }
+            return full;
+        }
+
+        static void log_link_details_when_strict(const Config& cfg, const std::string& cc) {
+            if (!cfg.strict && !cfg.hardline) return;
+            std::cerr << "[link] cc=" << cc << "\n";
+            if (!cfg.libpaths.empty()) {
+                std::cerr << "[link] libpaths:";
+                for (auto& p : cfg.libpaths) std::cerr << " " << p;
+                std::cerr << "\n";
+            }
+            if (!cfg.links.empty()) {
+                std::cerr << "[link] libs:";
+                for (auto& l : cfg.links) std::cerr << " " << l;
+                std::cerr << "\n";
+            }
+        }
+
+        // ------------- Ritual two-pass builder (automates @profile auto) -------------
+        struct RitualResult { int rc = 0; std::string exe; };
+
+        static RitualResult build_two_pass_ritual(Config cfg,
+            const std::string& cc,
+            const std::string& srcAll,
+            const ExtraCli& xcli) {
+            RitualResult rr{};
+            ensure_tmpdir_for_ci();
+
+            // Expand @use includes first
+            std::string source = apply_use_includes(srcAll, /*echo*/cfg.show_c);
+
+            const bool wantProfile = scan_profile_auto(source) || cfg.profile;
+            const bool warnRelaxed = scan_warn_relaxed(source);
+
+            // Parse -> body (reuse host pipeline pieces)
+            std::vector<std::string> bodyLines;
+            parse_directives_and_collect(source, cfg, bodyLines);
+            std::string body; for (auto& l : bodyLines) { body += l; body.push_back('\n'); }
+
+            // enum! lower + exhaustiveness (warn or die)
+            std::map<std::string, EnumInfo> enums;
+            std::string enumLowered = lower_enum_bang_and_collect(body, enums);
+            if (warnRelaxed) {
+                (void)check_exhaustiveness_relaxed(body, enums, /*relaxed*/true);
+            }
+            else {
+                check_exhaustiveness_or_die(body, enums);
+            }
+
+            // unsafe + match + softline setup (reuse host passes)
+            std::string unsafeLowered = lower_unsafe_blocks(enumLowered);
+            std::string matchLowered = lower_match_patterns(unsafeLowered);
+
+            auto build_once_C = [&](const std::string& c_src, const std::string& out, bool defineProfile)->int {
+                std::string cpath = write_temp("cscript_ritual.c", c_src);
+                if (xcli.emit_obj) {
+                    std::string objOut = out + ".obj";
+#if !defined(_WIN32)
+                    objOut = out + ".o";
+#endif
+                    std::string cmd = build_cmd_emit_obj(cfg, cc, cpath, objOut);
+                    if (xcli.show_c) { std::cerr << "--- generated C ---\n" << c_src << "\n--- end ---\n"; }
+                    int rc = run_cmd(cmd, /*echo*/true);
+                    if (!xcli.relaxed_cleanup) rm_file(cpath);
+                    return rc;
+                }
+                else {
+                    std::string cmd = build_cmd(cfg, cc, cpath, out, defineProfile);
+                    if (xcli.show_c) { std::cerr << "--- generated C ---\n" << c_src << "\n--- end ---\n"; }
+                    log_link_details_when_strict(cfg, cc);
+                    int rc = run_cmd(cmd, /*echo*/cfg.show_c);
+                    if (!xcli.relaxed_cleanup) rm_file(cpath);
+                    return rc;
+                }
+                };
+
+            auto mk_csrc = [&](const std::string& lowered) {
+                std::string csrc = prelude(cfg.hardline);
+                if (warnRelaxed) csrc += prelude_exhaustive_relaxed();
+                csrc += "\n"; csrc += lowered;
+                return csrc;
+                };
+
+            // Pass 1 (instrumented) + run
+            std::set<std::string> hotFns;
+            if (wantProfile) {
+                std::string inst = softline_lower(matchLowered, cfg.softline, /*hot*/{}, /*instrument*/true);
+                std::string csrc1 = mk_csrc(inst);
+
+                std::string tempExe;
+#if defined(_WIN32)
+                tempExe = write_temp("cscript_ritual_prof.exe", "");
+#else
+                tempExe = write_temp("cscript_ritual_prof.out", "");
+#endif
+                rm_file(tempExe);
+                int rc1 = build_once_C(csrc1, tempExe, /*defineProfile*/true);
+                if (rc1 != 0) { rr.rc = rc1; return rr; }
+
+                // Run once and read counts
+                std::string profPath = write_temp("cscript_profile.txt", ""); rm_file(profPath);
+                int rcRun = run_exe_with_env(tempExe, "CS_PROFILE_OUT", profPath);
+                if (rcRun != 0) std::cerr << "[ritual] instrumented run rc=" << rcRun << "\n";
+                auto counts = read_profile_counts(profPath);
+                hotFns = select_hot_functions(counts, 16);
+                if (!xcli.relaxed_cleanup) { rm_file(profPath); rm_file(tempExe); }
+            }
+
+            // Pass 2 (optimized)
+            std::string lowered2 = softline_lower(matchLowered, cfg.softline, hotFns, /*instrument*/false);
+            std::string csrc2 = mk_csrc(lowered2);
+
+            rr.exe = cfg.out;
+            rr.rc = build_once_C(csrc2, rr.exe, /*defineProfile*/false);
+            return rr;
+        }
+
+    } // namespace cs_ritual
+
+	// ============================ Public API ============================
+
+    int build_cscript_exe(const Config& cfg,
+        const std::string& cc,
+        const std::string& srcAll,
+        const std::vector<std::string>& extraCli,
+        std::string* outExe) {
+        using namespace cs_asmpack;
+        using namespace cs_ritual;
+        ExtraCli xcli = parse_extra_cli(extraCli);
+        if (cfg.ritual) {
+            auto rr = build_two_pass_ritual(cfg, cc, srcAll, xcli);
+            if (outExe) *outExe = rr.exe;
+            return rr.rc;
+        }
+        ensure_tmpdir_for_ci();
+        // Apply source lowerings
+        std::string lowered = apply_lowerings(srcAll);
+        if (xcli.show_c) { std::cerr << "--- lowered source ---\n" << lowered << "\n--- end ---\n"; }
+        // Scan and assemble external asm blocks
+        auto asmObjs = assemble_all(lowered, cc, cfg, /*echo*/cfg.show_c);
+        // Emit wasm embeds if any
+        std::string wasmEmbeds = emit_wasm_embeds(lowered, /*echo*/cfg.show_c);
+        if (!wasmEmbeds.empty()) {
+            lowered += "\n/* --- WASM EMBEDS --- */\n";
+            lowered += wasmEmbeds;
+            lowered += "\n/* --- END WASM EMBEDS --- */\n";
+        }
+        // Final C source
+        std::string csrc = prelude(cfg.hardline);
+        csrc += "\n"; csrc += lowered;
+        // Write to temp C file
+        std::string cpath = write_temp("cscript_final.c", csrc);
+        // Build command
+		std::string outPath = cfg.out;
+		if (outPath.empty()) {
+            #if defined(_WIN32)
+			outPath = "cscript_out.exe";
+#else
+			outPath = "cscript_out.out";
+#endif
+            }
+        std::string cmd = build_cmd_with_objects(cfg, cc, cpath, outPath, /*defineProfile*/false, asmObjs);
+        if (xcli.show_c) { std::cerr << "--- final C ---\n" << csrc << "\n--- end ---\n"; }
+        log_link_details_when_strict(cfg, cc);
+        int rc = run_cmd(cmd, /*echo*/cfg.show_c);
+        if (!xcli.relaxed_cleanup) rm_file(cpath);
+        if (outExe) *outExe = (rc == 0) ? outPath : std::string();
+        return rc;
+	}
+	} // namespace cscript
+	} // extern "C"
+#else
+#error "C-Script source-to-source compiler requires C++11 or later"
+#endif
+// End of Source2.cpp
+// End of Source2.cpp
+// Source2.cpp - C-Script source-to-source compiler (C++11)
+// Part of C-Script:
+//
+//
