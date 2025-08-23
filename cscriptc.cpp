@@ -6192,3 +6192,680 @@ static const CS_EnumInfo* cs_enum_find(const char* name){
 
 } // namespace cs_reflect
 
+// ============================ Serialization + C23 + DB + Command Prompt Pack (append-only) ============================
+namespace cs_serdb {
+
+    // ------------------------------ C prelude addendum (JSON, Reflection-based serialization, DB, Command) ------------------------------
+    static std::string prelude_serdb_addendum() {
+        return R"(
+/* --- Serialization + DB + Command Addendum --- */
+#ifndef CS_SERDB_INCLUDED
+#define CS_SERDB_INCLUDED 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+/* ===== JSON buffer and escaping ===== */
+typedef struct { char* p; size_t len, cap; } CS_JBuf;
+static void cs_jb_init(CS_JBuf* b, size_t cap){ b->p=(char*)malloc(cap?cap:256); b->len=0; b->cap=cap?cap:256; if(b->p) b->p[0]=0; }
+static void cs_jb_free(CS_JBuf* b){ if(b->p) free(b->p); b->p=NULL; b->len=b->cap=0; }
+static void cs_jb_putn(CS_JBuf* b, const char* s, size_t n){
+    if(!b->p) return; if (b->len+n+1>b->cap){ size_t nc=b->cap*2; if(!nc) nc=256; while(nc<b->len+n+1) nc*=2; char* q=(char*)realloc(b->p,nc); if(!q) return; b->p=q; b->cap=nc; }
+    memcpy(b->p+b->len, s, n); b->len+=n; b->p[b->len]=0;
+}
+static void cs_jb_puts(CS_JBuf* b, const char* s){ cs_jb_putn(b,s,strlen(s)); }
+static void cs_jb_putc(CS_JBuf* b, char c){ cs_jb_putn(b,&c,1); }
+static void cs_json_str(CS_JBuf* b, const char* s){
+    cs_jb_putc(b,'"'); for(;*s;++s){ unsigned char c=(unsigned char)*s;
+      if(c=='"'||c=='\\'){ cs_jb_putc(b,'\\'); cs_jb_putc(b,(char)c); }
+      else if(c=='\b'){ cs_jb_puts(b,"\\b"); } else if(c=='\f'){ cs_jb_puts(b,"\\f"); }
+      else if(c=='\n'){ cs_jb_puts(b,"\\n"); } else if(c=='\r'){ cs_jb_puts(b,"\\r"); }
+      else if(c=='\t'){ cs_jb_puts(b,"\\t"); } else if(c<0x20){ char tmp[7]; snprintf(tmp,sizeof(tmp),"\\u%04x",c); cs_jb_puts(b,tmp); }
+      else cs_jb_putc(b,(char)c);
+    } cs_jb_putc(b,'"');
+}
+static void cs_json_key(CS_JBuf* b, const char* k){ cs_json_str(b,k); cs_jb_putc(b,':'); }
+
+/* ===== Reflection-aware serialization (best-effort) ===== */
+#if defined(CS_REFLECT_INCLUDED)
+extern const CS_TypeInfo cs_types[]; extern const unsigned cs_types_count;
+static const CS_TypeInfo* cs__type_find_local(const char* name){
+    for(unsigned i=0;i<cs_types_count;i++){ if(strcmp(cs_types[i].name,name)==0) return &cs_types[i]; }
+    return NULL;
+}
+static void cs_json_any(CS_JBuf* b, const char* typeName, const void* obj){
+    const CS_TypeInfo* T = cs__type_find_local(typeName);
+    if(!T){ cs_jb_puts(b,"null"); return; }
+    cs_jb_putc(b,'{');
+    for(unsigned i=0;i<T->field_count;i++){
+        const CS_FieldInfo* f = &T->fields[i];
+        if(i) cs_jb_putc(b,',');
+        cs_json_key(b, f->name);
+        /* Heuristic basic types by field->type string */
+        const char* t = f->type;
+        const unsigned char* base = (const unsigned char*)obj;
+        const void* ptr = base + f->offset;
+        if (strstr(t,"char*")) { const char* s = *(const char* const*)ptr; if(s) cs_json_str(b,s); else cs_jb_puts(b,"null"); }
+        else if (strstr(t,"float")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%g", *(const float*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"double")){ char tmp[64]; snprintf(tmp,sizeof(tmp),"%g", *(const double*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"bool"))  { cs_jb_puts(b, (*(const int*)ptr) ? "true":"false"); }
+        else if (strstr(t,"int8")||strstr(t,"char"))  { char tmp[64]; snprintf(tmp,sizeof(tmp),"%d",(int)*(const signed char*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"uint8")||strstr(t,"unsigned char")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%u",(unsigned)*(const unsigned char*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"int16")||strstr(t,"short")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%d",(int)*(const short*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"uint16")||strstr(t,"unsigned short")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%u",(unsigned)*(const unsigned short*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"int64")||strstr(t,"long long")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%lld",(long long)*(const long long*)ptr); cs_jb_puts(b,tmp); }
+        else if (strstr(t,"uint64")||strstr(t,"unsigned long long")) { char tmp[64]; snprintf(tmp,sizeof(tmp),"%llu",(unsigned long long)*(const unsigned long long*)ptr); cs_jb_puts(b,tmp); }
+        else { /* fallback: 32-bit signed */ char tmp[64]; snprintf(tmp,sizeof(tmp),"%d", *(const int*)ptr); cs_jb_puts(b,tmp); }
+    }
+    cs_jb_putc(b,'}');
+}
+#else
+static void cs_json_any(CS_JBuf* b, const char* typeName, const void* obj){
+    (void)typeName;(void)obj; cs_jb_puts(b,"null"); /* reflection not available */
+}
+#endif
+
+/* Pretty printer for convenience */
+static void cs_json_print(const char* typeName, const void* obj){
+    CS_JBuf b; cs_jb_init(&b, 0); cs_json_any(&b, typeName, obj); fwrite(b.p,1,b.len,stdout); fputc('\n',stdout); cs_jb_free(&b);
+}
+
+/* ===== DSL helpers (optional): json!(ptr, TypeName) and cmd!("line") ===== */
+#define CS_JSON_OF(ptr,TypeName) do{ cs_json_print(#TypeName,(const void*)(ptr)); }while(0)
+
+/* ===== Command runner and prompt ===== */
+static int cs_cmd_run(const char* line){
+#if defined(_WIN32)
+    (void)line; /* Use system directly; cmd.exe is the default shell for system() */
+    return system(line);
+#else
+    return system(line);
+#endif
+}
+static void cs_cmd_prompt(const char* banner){
+    char buf[1024]; if(banner) fprintf(stderr,"%s\n", banner);
+    fprintf(stderr,"> "); fflush(stderr);
+    while (fgets(buf, sizeof(buf), stdin)){
+        size_t n=strlen(buf); if(n && (buf[n-1]=='\n'||buf[n-1]=='\r')) buf[n-1]=0;
+        if(!strcmp(buf,"exit")||!strcmp(buf,"quit")) break;
+        (void)cs_cmd_run(buf);
+        fprintf(stderr,"> "); fflush(stderr);
+    }
+}
+
+/* ===== SQLite dynamic loader (best-effort) + minimal API ===== */
+typedef struct {
+    void* h;
+    int (*sqlite3_open)(const char*, void**);
+    int (*sqlite3_close)(void*);
+    int (*sqlite3_exec)(void*, const char*, int (*)(void*,int,char**,char**), void*, char**);
+} CS_Sqlite;
+static CS_Sqlite cs_sqlite_load(void){
+    CS_Sqlite S; memset(&S,0,sizeof(S));
+#if defined(_WIN32)
+    HMODULE h = LoadLibraryA("sqlite3.dll");
+    if(!h) return S; S.h=(void*)h;
+    S.sqlite3_open  = (int(*)(const char*,void**))GetProcAddress(h,"sqlite3_open");
+    S.sqlite3_close = (int(*)(void*))GetProcAddress(h,"sqlite3_close");
+    S.sqlite3_exec  = (int(*)(void*,const char*,int(*)(void*,int,char**,char**),void*,char**))GetProcAddress(h,"sqlite3_exec");
+#else
+    void* h = dlopen("libsqlite3.so", RTLD_LAZY);
+    if(!h) h = dlopen("libsqlite3.dylib", RTLD_LAZY);
+    if(!h) return S; S.h=h;
+    S.sqlite3_open  = (int(*)(const char*,void**))dlsym(h,"sqlite3_open");
+    S.sqlite3_close = (int(*)(void*))dlsym(h,"sqlite3_close");
+    S.sqlite3_exec  = (int(*)(void*,const char*,int(*)(void*,int,char**,char**),void*,char**))dlsym(h,"sqlite3_exec");
+#endif
+    return S;
+}
+typedef struct { CS_Sqlite api; void* db; } CS_DB;
+static CS_DB cs_db_open(const char* path){
+    CS_DB D; memset(&D,0,sizeof(D)); D.api = cs_sqlite_load();
+    if (!D.api.sqlite3_open) { fprintf(stderr,"[db] sqlite3 not found; open failed\n"); return D; }
+    if (D.api.sqlite3_open(path?path:":memory:", &D.db)!=0) { D.db=NULL; fprintf(stderr,"[db] open failed\n"); }
+    return D;
+}
+static void cs_db_close(CS_DB* D){ if(D && D->db && D->api.sqlite3_close){ D->api.sqlite3_close(D->db); D->db=NULL; } }
+static int cs_db_exec(CS_DB* D, const char* sql){
+    if(!D||!D->db||!D->api.sqlite3_exec) return -1;
+    char* err=0; int rc = D->api.sqlite3_exec(D->db, sql, NULL, NULL, &err);
+    if (rc!=0 && err){ fprintf(stderr,"[db] %s\n", err); /* sqlite3_free if present – omitted */ }
+    return rc;
+}
+
+/* ===== Lightweight macros for DSL lowerings (optional) ===== */
+#define CS_CMD(line) cs_cmd_run((line))
+/* json! lowering uses CS_JSON_OF via compiler front-end */
+
+#endif /* CS_SERDB_INCLUDED */
+)";
+    }
+
+    // ------------------------------ Optional build helper: C23 glue ------------------------------
+    static std::string build_cmd_c23_glue(const Config& cfg, const std::string& cc, const std::string& cpath, const std::string& out,
+        bool defineProfile = false, const std::string& src_for_scan = std::string()) {
+        // If your earlier C23 pack exists (cs_c23_support::build_cmd_c23), prefer it; otherwise fall back to legacy build_cmd.
+        // We call the existing build_cmd in this translation unit.
+        (void)src_for_scan;
+        return build_cmd(cfg, cc, cpath, out, defineProfile);
+    }
+
+    // ------------------------------ Optional DSL lowerings (json!, cmd!) ------------------------------
+    static std::string apply_lowerings(const std::string& src) {
+        using namespace cs_regex_wrap;
+        std::string s = src, out; out.reserve(s.size());
+        // json!(ptr, TypeName) -> CS_JSON_OF(ptr, TypeName)
+        {
+            std::regex re(R"(json!\s*\(\s*([\s\S]*?)\s*,\s*([A-Za-z_]\w*)\s*\))", std::regex::ECMAScript);
+            cmatch m; size_t pos = 0;
+            while (search_from(s, pos, m, re)) {
+                append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                out += "CS_JSON_OF((" + m[1].str() + ")," + m[2].str() + ")";
+            }
+            out.append(s, pos, std::string::npos); s.swap(out); out.clear(); out.reserve(s.size());
+        }
+        // cmd!("line") -> CS_CMD("line")
+        {
+            std::regex re(R"(cmd!\s*\(\s*\"([\s\S]*?)\"\s*\))", std::regex::ECMAScript);
+            cmatch m; size_t pos = 0;
+            while (search_from(s, pos, m, re)) {
+                append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                out += "CS_CMD(\"" + m[1].str() + "\")";
+            }
+            out.append(s, pos, std::string::npos);
+        }
+        return s;
+    }
+
+} // namespace cs_serdb
+// ============================ End of cscript.cpp ============================
+// ============================ Complete CScript Pack (append-only) ============================
+
+namespace cs {
+    // Build C source code with optional DSL lowerings and addenda
+    int build_cscript(const Config& cfg, const std::string& cc, const std::string& procSrc, const std::string& outPath,
+        bool echo = false, bool srcAll = false) {
+        using namespace cs_regex_wrap;
+        // Scan for directives
+        bool enableBounds = cs_bounds::scan_bounds_directive(procSrc);
+        if (echo) {
+            std::cerr << "[build] bounds: " << (enableBounds ? "on" : "off") << "\n";
+        }
+        // Apply DSL lowerings
+        std::string src = procSrc;
+        src = cs_bounds::apply_lowerings(src, enableBounds);
+        src = cs_serdb::apply_lowerings(src);
+        // Compose final source with addenda
+        std::string finalSrc;
+        finalSrc += "#include <stddef.h>\n"; // for offsetof
+        finalSrc += cs_runtime_core::prelude_runtime_addendum();
+        if (enableBounds) {
+            finalSrc += cs_bounds::prelude_bounds_addendum();
+        }
+        finalSrc += src;
+        finalSrc += cs_reflect::emit_from_source(finalSrc, echo);
+        finalSrc += cs_serdb::prelude_serdb_addendum();
+		// Write to temporary .c file and build
+        std::string tmpCPath = outPath + ".tmp.c";
+        if (!cs_write_file(tmpCPath, finalSrc.data(), finalSrc.size())) {
+            std::cerr << "[error] failed to write temporary C file: " << tmpCPath << "\n";
+            return 1;
+        }
+        if (echo) {
+            std::cerr << "[build] written temporary C file: " << tmpCPath << " (" << finalSrc.size() << " bytes)\n";
+            if (srcAll) {
+                std::cerr << "----- begin full source -----\n";
+                std::cerr << finalSrc;
+                std::cerr << "----- end full source -----\n";
+            }
+        }
+        // Build command
+        std::string buildCmd = cs_serdb::build_cmd_c23_glue(cfg, cc, tmpCPath, outPath, true, finalSrc);
+        if (echo) {
+            std::cerr << "[build] running: " << buildCmd << "\n";
+        }
+        int rc = system(buildCmd.c_str());
+        if (rc != 0) {
+            std::cerr << "[error] build failed with code: " << rc << "\n";
+            return rc;
+        }
+        // Success
+        if (echo) {
+            std::cerr << "[build] success, output: " << outPath << "\n";
+        }
+        // Cleanup temporary C file
+        cs_remove_file(tmpCPath);
+        return 0;
+	}
+} // namespace cs
+// ============================ End of cscript.cpp ============================
+// ============================ End of CScript Pack ============================
+/* --- Runtime Core Addendum --- */
+#ifndef CS_RUNTIME_CORE_INCLUDED
+#define CS_RUNTIME_CORE_INCLUDED 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+#if defined(_WIN32)
+  #include <windows.h>
+#include <bcrypt.h> /* link with -lbcrypt */
+  #include <io.h>
+#include <process.h>
+#else
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <sys/types.h>
+  #include <sys/stat.h>
+  #if defined(__linux__)
+    #include <sys/sysinfo.h>
+    #include <sys/random.h>
+  #else
+    #include <sys/param.h>
+    #include <sys/sysctl.h>
+    #include <dlfcn.h>
+#endif
+#endif
+#include <stdint.h>
+#include <errno.h>
+#include <limits.h>
+#include <inttypes.h>
+#include <math.h>
+#include <ctype.h>
+#include <time.h>
+#include <float.h>
+
+/* ===== File I/O ===== */
+static int cs_rt_read_file(const char* path, void** outData, size_t* outLen){
+    FILE* f = fopen(path, "rb"); if(!f) return 0;
+    if (fseek(f, 0, SEEK_END)!=0){ fclose(f); return 0; }
+    long sz = ftell(f); if(sz<0){ fclose(f); return 0; }
+	if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    void* data = malloc((size_t)sz + 1); if(!data){ fclose(f); return 0; }
+    size_t n = fread(data, 1, (size_t)sz, f); fclose(f);
+    if(n!=(size_t)sz){ free(data); return 0; }
+    ((char*)data)[n]=0; if(outData) *outData=data; else free(data);
+	if (outLen) *outLen = n; return 1;
+}
+static int cs_rt_write_file(const char* path, const void* data, size_t len){
+	FILE* f = fopen(path, "wb
+		"); if (!f) return 0;
+		size_t n = fwrite(data, 1, len, f); fclose(f);
+	if (n != len) return 0; return 1;
+}
+/* ===== Time ===== */
+static double cs_rt_time_now() {
+    #if defined(_WIN32)
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    uint64_t t = (((uint64_t)ft.dwHighDateTime)<<32) | ((uint64_t)ft.dwLowDateTime);
+	return (double)(t / 10000000.0 - 11644473600.0); /* seconds since Unix epoch */
+    #else
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+/* ===== Randomness ===== */
+static int cs_rt_random_bytes(void* buf, size_t len) {
+	if (!buf || len == 0) return 0;
+    #if defined(_WIN32)
+    if (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) return 1;
+	return 0;
+    #elif defined(__linux__)
+    if (getrandom(buf, len, 0) == (ssize_t)len) return 1;
+    // fallback to /dev/urandom
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, len); close(fd);
+    return n == (ssize_t)len ? 1 : 0;
+    #else
+    // BSD/macOS: use sysctl
+    size_t req = len;
+    if (sysctlbyname("kern.random", buf, &req, NULL, 0) == 0 && req == len) return 1;
+    // fallback to /dev/urandom
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, len); close(fd);
+	return n == (ssize_t)len ? 1 : 0;
+#endif
+
+    // ============================ Inline Hex + Assembly Pack (append-only) ============================
+    namespace cs_asmpack {
+
+        // ---------- Prelude for generated C (inline asm + helpers) ----------
+        static std::string prelude_asm_addendum() {
+            return R"(
+/* --- Inline Assembly + Hex Prelude Addendum --- */
+#ifndef CS_ASM_INCLUDED
+#define CS_ASM_INCLUDED 1
+#include <stdint.h>
+#if defined(_MSC_VER)
+  #include <intrin.h>
+  #ifndef __has_builtin
+    #define __has_builtin(x) 0
+  #endif
+#endif
+
+/* Portable inline asm wrappers:
+   - CS_ASM("...") inserts best-effort inline assembly.
+   - On MSVC x64, inline asm is not supported: empty bodies become __debugbreak();
+*/
+#if defined(_MSC_VER)
+  #if defined(_M_X64)
+    #define CS_ASM(x) do{ (void)(x); __debugbreak(); }while(0) /* no inline asm on MSVC x64 */
+  #else
+    #define CS_ASM(x) __asm { x }
+  #endif
+#else
+  #define CS_ASM(x) __asm__ __volatile__(x : : : "memory")
+#endif
+
+/* Small helpers for byte arrays composed at translation time (from front-end lowerings) */
+#define CS_HEX_BYTES_LIT(...) ((const unsigned char[]){ __VA_ARGS__ })
+
+#endif /* CS_ASM_INCLUDED */
+)";
+        }
+
+        // ---------- DSL lowerings: hex, inline asm (regex-based) ----------
+        using namespace cs_regex_wrap;
+
+        // Remove underscores in hex numerics: 0xDE_AD_BE_EF -> 0xDEADBEEF
+        static std::string lower_hex_numeric_underscores(const std::string& src) {
+            std::string s = src, out; out.reserve(s.size());
+            std::regex re(R"(0x[0-9A-Fa-f_]+)");
+            cmatch m; size_t pos = 0;
+            while (search_from(s, pos, m, re)) {
+                append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                std::string t = m[0].str();
+                t.erase(std::remove(t.begin(), t.end(), '_'), t.end());
+                out += t;
+            }
+            out.append(s, pos, std::string::npos);
+            return out;
+        }
+
+        // hexu{8,16,32,64}!("DE AD ...") -> 0xDEAD...ULL etc.
+        static std::string lower_hex_uints(const std::string& src) {
+            auto fold = [](const std::string& hex, unsigned bits)->std::string {
+                std::string h; h.reserve(hex.size());
+                for (char c : hex) { if (isxdigit((unsigned char)c)) h.push_back((char)toupper((unsigned char)c)); }
+                if (h.empty()) h = "0";
+                std::string suf = (bits == 64 ? "ULL" : (bits == 32 ? "U" : "U"));
+                return "0x" + h + suf;
+                };
+            std::string s = src, out; out.reserve(s.size());
+            struct Rule { std::regex re; unsigned bits; };
+            std::vector<Rule> rules = {
+                { std::regex(R"(hexu8!\s*\(\s*\"([\s\S]*?)\"\s*\))"), 8u },
+                { std::regex(R"(hexu16!\s*\(\s*\"([\s\S]*?)\"\s*\))"), 16u },
+                { std::regex(R"(hexu32!\s*\(\s*\"([\s\S]*?)\"\s*\))"), 32u },
+                { std::regex(R"(hexu64!\s*\(\s*\"([\s\S]*?)\"\s*\))"), 64u }
+            };
+            for (size_t r = 0; r < rules.size(); ++r) {
+                cmatch m; size_t pos = 0; out.clear(); out.reserve(s.size());
+                while (search_from(s, pos, m, rules[r].re)) {
+                    append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                    out += fold(m[1].str(), rules[r].bits);
+                }
+                out.append(s, pos, std::string::npos); s.swap(out);
+            }
+            return s;
+        }
+
+        // hexbytes!("DE AD BE EF") -> ((const unsigned char[]){0xDE,0xAD,0xBE,0xEF})
+        // hexlen!("DE AD") -> integer count
+        static std::string lower_hex_bytes_and_len(const std::string& src) {
+            auto mkbytes = [](const std::string& in)->std::pair<std::string, int> {
+                std::string h; h.reserve(in.size());
+                for (char c : in) { if (isxdigit((unsigned char)c)) h.push_back((char)toupper((unsigned char)c)); }
+                if (h.size() % 2 == 1) h = "0" + h;
+                std::ostringstream b;
+                int n = 0;
+                for (size_t i = 0; i + 1 < h.size(); i += 2) {
+                    b << "0x" << h[i] << h[i + 1];
+                    if (i + 2 < h.size()) b << ",";
+                    n++;
+                }
+                return { b.str(), n };
+                };
+            std::string s = src, out; out.reserve(s.size());
+            // hexbytes!
+            {
+                std::regex re(R"(hexbytes!\s*\(\s*\"([\s\S]*?)\"\s*\))", std::regex::ECMAScript);
+                cmatch m; size_t pos = 0;
+                while (search_from(s, pos, m, re)) {
+                    append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                    auto pr = mkbytes(m[1].str());
+                    out += "(CS_HEX_BYTES_LIT(" + pr.first + "))";
+                }
+                out.append(s, pos, std::string::npos); s.swap(out);
+            }
+            // hexlen!
+            {
+                std::regex re(R"(hexlen!\s*\(\s*\"([\s\S]*?)\"\s*\))", std::regex::ECMAScript);
+                cmatch m; size_t pos = 0; out.clear(); out.reserve(s.size());
+                while (search_from(s, pos, m, re)) {
+                    append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                    auto pr = mkbytes(m[1].str());
+                    out += std::to_string(pr.second);
+                }
+                out.append(s, pos, std::string::npos);
+            }
+            return out;
+        }
+
+        // asm!("...") and asm!{ ... } -> CS_ASM("...") or mapped MSVC/GNU forms (via CS_ASM macro in prelude)
+        static std::string lower_inline_asm(const std::string& src) {
+            std::string s = src, out; out.reserve(s.size());
+            // asm!("text")
+            {
+                std::regex re(R"(asm!\s*\(\s*\"([\s\S]*?)\"\s*\))", std::regex::ECMAScript);
+                cmatch m; size_t pos = 0;
+                while (search_from(s, pos, m, re)) {
+                    append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                    // Escape internal quotes for C string (already inside C since we compile a C TU)
+                    std::string body = m[1].str();
+                    // Keep as-is; the front-end is outputting raw C.
+                    out += "CS_ASM(\"" + body + "\")";
+                }
+                out.append(s, pos, std::string::npos); s.swap(out);
+            }
+            // asm!{ ... } -> CS_ASM("...") with newlines escaped
+            {
+                std::regex re(R"(asm!\s*\{\s*([\s\S]*?)\s*\})", std::regex::ECMAScript);
+                cmatch m; size_t pos = 0; out.clear(); out.reserve(s.size());
+                while (search_from(s, pos, m, re)) {
+                    append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
+                    std::string body = m[1].str();
+                    // Replace newlines with \n and quotes with \"
+                    std::string esc; esc.reserve(body.size() * 2);
+                    for (char c : body) {
+                        if (c == '\\') { esc += "\\\\"; }
+                        else if (c == '"') { esc += "\\\""; }
+                        else if (c == '\n' || c == '\r') { esc += "\\n"; }
+                        else { esc.push_back(c); }
+                    }
+                    out += "CS_ASM(\"" + esc + "\")";
+                }
+                out.append(s, pos, std::string::npos);
+            }
+            return out;
+        }
+
+        // Apply all source lowerings (call before softline_lower)
+        static std::string apply_lowerings(const std::string& src) {
+            std::string t = lower_hex_numeric_underscores(src);
+            t = lower_hex_uints(t);
+            t = lower_hex_bytes_and_len(t);
+            t = lower_inline_asm(t);
+            return t;
+        }
+
+        // ---------- External assembler blocks (nasm!/masm!/gas!/wasm!) ----------
+        struct AsmBlock { std::string flavor; std::string name; std::string source; };
+        struct WasmBlock { std::string name; std::string wat; std::string wasmPath; std::vector<unsigned char> bytes; };
+
+        static std::string trim(std::string s) {
+            size_t a = s.find_first_not_of(" \t\r\n"); if (a == std::string::npos) return "";
+            size_t b = s.find_last_not_of(" \t\r\n"); return s.substr(a, b - a + 1);
+        }
+
+        static std::vector<AsmBlock> scan_asm_blocks(const std::string& src) {
+            std::vector<AsmBlock> v;
+            auto scan = [&](const char* tag)->void {
+                std::regex re(std::string(tag) + R"(\s+([A-Za-z_]\w*)\s*\{([\s\S]*?)\})", std::regex::ECMAScript);
+                cmatch m; size_t pos = 0;
+                while (search_from(src, pos, m, re)) {
+                    AsmBlock b; b.flavor = trim(std::string(tag, tag + std::strlen(tag) - 1)); b.name = trim(m[1].str()); b.source = m[2].str();
+                    v.push_back(std::move(b));
+                }
+                };
+            scan("nasm!"); scan("masm!"); scan("gas!"); // wasm handled separately
+            return v;
+        }
+
+        static std::vector<WasmBlock> scan_wasm_blocks(const std::string& src) {
+            std::vector<WasmBlock> v;
+            std::regex re(R"(wasm!\s+([A-Za-z_]\w*)\s*\{([\s\S]*?)\})", std::regex::ECMAScript);
+            cmatch m; size_t pos = 0;
+            while (search_from(src, pos, m, re)) {
+                WasmBlock w; w.name = trim(m[1].str()); w.wat = m[2].str(); v.push_back(std::move(w));
+            }
+            return v;
+        }
+
+        static bool tool_exists(const std::string& cmd) {
+#if defined(_WIN32)
+            std::string c = cmd + " --version > NUL 2>&1";
+#else
+            std::string c = cmd + " --version > /dev/null 2>&1";
+#endif
+            return system(c.c_str()) == 0;
+        }
+
+        // Assembles all assembler blocks to object files and returns their paths.
+        static std::vector<std::string> assemble_all(const std::string& srcAll, const std::string& cc, const Config& cfg, bool echo = false) {
+            (void)cfg;
+            auto blocks = scan_asm_blocks(srcAll);
+            std::vector<std::string> objs;
+            for (auto& b : blocks) {
+                // Write source to temp
+                std::string ext = (b.flavor == "gas" ? ".S" : ".asm");
+                std::string inpath = write_temp("cscript_asm_" + b.name + ext, b.source);
+                // Choose object extension
+#if defined(_WIN32)
+                std::string obj = write_temp("cscript_asm_" + b.name + ".obj", "");
+                rm_file(obj);
+#else
+                std::string obj = write_temp("cscript_asm_" + b.name + ".o", "");
+                rm_file(obj);
+#endif
+                std::string cmd; int rc = 1;
+                if (b.flavor == "nasm") {
+#if defined(_WIN32)
+                    std::string fmt = "win64";
+#else
+                    std::string fmt = "elf64";
+#endif
+                    cmd = "nasm -f " + fmt + " -o \"" + obj + "\" \"" + inpath + "\"";
+                    rc = system(cmd.c_str());
+                }
+                else if (b.flavor == "masm") {
+#if defined(_WIN32)
+                    // Prefer ml64, fallback ml
+                    if (tool_exists("ml64")) {
+                        cmd = "ml64 /nologo /c /Fo \"" + obj + "\" \"" + inpath + "\"";
+                    }
+                    else {
+                        cmd = "ml /nologo /c /Fo \"" + obj + "\" \"" + inpath + "\"";
+                    }
+                    rc = system(cmd.c_str());
+#else
+                    rc = 1; // MASM not available
+#endif
+                }
+                else if (b.flavor == "gas") {
+                    // Use current C compiler as assembler
+                    cmd = cc + " -c \"" + inpath + "\" -o \"" + obj + "\"";
+                    rc = system(cmd.c_str());
+                }
+                if (echo) std::cerr << "[asm] " << b.flavor << " " << b.name << " rc=" << rc << (cmd.empty() ? "" : " cmd=" + cmd) << "\n";
+                if (rc == 0) { objs.push_back(obj); }
+                else { rm_file(obj); }
+                // Keep sources for debugging when show_c; otherwise they live in temp dir anyway.
+            }
+            return objs;
+        }
+
+        // Augment build command with extra object inputs (keeps baseline flags)
+        static std::string build_cmd_with_objects(const Config& cfg,
+            const std::string& cc,
+            const std::string& cpath,
+            const std::string& out,
+            bool defineProfile,
+            const std::vector<std::string>& extraObjs) {
+            // Reuse existing build_cmd then append objects right before output/link section if possible
+            std::string base = build_cmd(cfg, cc, cpath, out, defineProfile);
+            if (extraObjs.empty()) return base;
+
+            // Heuristic: append object paths just before final output flag if present; otherwise to the end.
+            std::string cmd = base;
+            for (const auto& o : extraObjs) {
+                cmd += " \"" + o + "\"";
+            }
+            return cmd;
+        }
+
+        // Compile wasm (wat -> wasm) if wat2wasm exists, then embed bytes; always embeds even if tool missing.
+        static std::string emit_wasm_embeds(const std::string& srcAll, bool echo = false) {
+            auto ws = scan_wasm_blocks(srcAll);
+            if (ws.empty()) return std::string();
+            bool have_wat2wasm = tool_exists("wat2wasm");
+            std::ostringstream o;
+            o << "\n/* --- Embedded WASM blobs --- */\n";
+            o << "typedef struct { const char* name; const unsigned char* data; unsigned int size; } CS_EmbeddedWasm;\n";
+            for (auto& w : ws) {
+                std::string inpath = write_temp("cscript_wasm_" + w.name + ".wat", w.wat);
+                std::string wasmPath = write_temp("cscript_wasm_" + w.name + ".wasm", "");
+                rm_file(wasmPath);
+                int rc = 1;
+                if (have_wat2wasm) {
+                    std::string cmd = "wat2wasm \"" + inpath + "\" -o \"" + wasmPath + "\"";
+                    rc = system(cmd.c_str());
+                    if (echo) std::cerr << "[wasm] " << w.name << " rc=" << rc << "\n";
+                }
+                std::vector<unsigned char> bytes;
+                try {
+                    std::string bin = (have_wat2wasm && rc == 0) ? read_file(wasmPath) : w.wat;
+                    bytes.assign(bin.begin(), bin.end());
+                }
+                catch (...) {
+                    // fallback to wat text
+                    bytes.assign(w.wat.begin(), w.wat.end());
+                }
+                // Emit as C array
+                o << "static const unsigned char cs_wasm_" << w.name << "[] = {";
+                for (size_t i = 0; i < bytes.size(); ++i) {
+                    if (i % 16 == 0) o << "\n  ";
+                    o << "0x" << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+                        << (int)(unsigned char)bytes[i] << std::nouppercase << std::dec;
+                    if (i + 1 < bytes.size()) o << ",";
+                }
+                if (!bytes.empty()) o << "\n";
+                o << "};\n";
+                o << "static const unsigned int cs_wasm_" << w.name << "_len = (unsigned int)sizeof(cs_wasm_" << w.name << ");\n";
+                rm_file(inpath); rm_file(wasmPath);
+            }
+            // Registry
+            o << "static const CS_EmbeddedWasm cs_wasms[] = {\n";
+            for (auto& w : ws) {
+                o << "  { \"" << w.name << "\", cs_wasm_" << w.name << ", cs_wasm_" << w.name << "_len },\n";
+            }
+            o << "};\n";
+            o << "static const unsigned int cs_wasms_count = (unsigned int)(sizeof(cs_wasms)/sizeof(cs_wasms[0]));\n";
+            return o.str();
+        }
+
+    } // namespace cs_asmpack
