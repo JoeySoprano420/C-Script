@@ -7289,3 +7289,300 @@ static int cs_rt_random_bytes(void* buf, size_t len) {
 // Part of C-Script:
 //
 //
+
+// ============================ IR-Only Self-Bootstrap Pack (append-only) ============================
+// Ensures IR-level profiling replaces any text-level instrumentation and builds entirely in-process.
+// Dependencies: build this TU with -DCS_EMBED_LLVM=1 and link LLVM/Clang/LLD as already described above.
+// Optional: -DCS_PGO_EMBED=1 (not required; IR pass included here).
+// Optional (enforce): -DCS_ENSURE_IR_ONLY=1 to use the IR-only main provided below.
+
+#if defined(CS_EMBED_LLVM)
+
+#include <memory>
+#include <unordered_set>
+
+#include "llvm/ADT/Triple.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/WithColor.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+
+// Forward-decls (already defined above in this TU; internal linkage is OK within TU)
+static std::pair<std::unique_ptr<llvm::Module>, std::unique_ptr<llvm::LLVMContext>>
+cs_compile_c_to_module_inproc(const std::string& c_source,
+    const Config& cfg,
+    const std::vector<std::string>& incs,
+    const std::vector<std::string>& defines);
+static int cs_link_with_lld(const Config& cfg, llvm::MemoryBufferRef objRef, const std::string& outPath);
+
+// Tiny utility: opt level from Config.opt
+static llvm::CodeGenOpt::Level cs_cg_opt_from_cfg(const Config& cfg) {
+    if (cfg.opt == "O0") return llvm::CodeGenOpt::None;
+    if (cfg.opt == "O1") return llvm::CodeGenOpt::Less;
+    if (cfg.opt == "O2") return llvm::CodeGenOpt::Default;
+    return llvm::CodeGenOpt::Aggressive; // O3 / max / size
+}
+
+// Emit object from LLVM Module (in-memory)
+static std::unique_ptr<llvm::MemoryBuffer> cs_emit_obj_from_module_LLVM(llvm::Module& M, const Config& cfg) {
+    using namespace llvm;
+    static bool inited = false;
+    if (!inited) {
+        InitializeAllTargets();
+        InitializeAllTargetMCs();
+        InitializeAllAsmParsers();
+        InitializeAllAsmPrinters();
+        inited = true;
+    }
+
+    std::string triple = sys::getDefaultTargetTriple();
+    M.setTargetTriple(triple);
+
+    std::string err;
+    const Target* T = TargetRegistry::lookupTarget(triple, err);
+    if (!T) throw std::runtime_error("Target lookup failed: " + err);
+
+    TargetOptions opt;
+    std::unique_ptr<TargetMachine> TM(
+        T->createTargetMachine(triple, sys::getHostCPUName().str(), "", opt, Reloc::PIC_,
+            CodeModel::Default, cs_cg_opt_from_cfg(cfg)));
+    if (!TM) throw std::runtime_error("TargetMachine creation failed");
+
+    M.setDataLayout(TM->createDataLayout());
+
+    // Set up output buffer
+    auto ObjBuf = std::make_unique<SmallVectorMemoryBuffer>();
+    llvm::SmallVector<char, 0> SV;
+    llvm::raw_svector_ostream OS(SV);
+
+    // New PM (thin wrapper via legacy is simpler for codegen)
+    llvm::legacy::PassManager PM;
+    llvm::CodeGenFileType FileType = llvm::CodeGenFileType::CGFT_ObjectFile;
+    if (TM->addPassesToEmitFile(PM, OS, nullptr, FileType))
+        throw std::runtime_error("TargetMachine cannot emit object file for this module");
+    PM.run(M);
+
+    // Move into MemoryBuffer
+    std::unique_ptr<llvm::MemoryBuffer> MB =
+        std::make_unique<llvm::SmallVectorMemoryBuffer>(std::move(SV));
+    return MB;
+}
+
+// IR-level profiling pass (inserts cs_prof_hit at each function entry)
+struct CSProfilePass_IR : llvm::PassInfoMixin<CSProfilePass_IR> {
+    llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
+        using namespace llvm;
+        LLVMContext& C = M.getContext();
+        FunctionCallee Hit = M.getOrInsertFunction(
+            "cs_prof_hit",
+            FunctionType::get(Type::getVoidTy(C), { Type::getInt8PtrTy(C) }, false));
+
+        for (Function& F : M) {
+            if (F.isDeclaration()) continue;
+            if (F.getName().startswith("llvm.")) continue;
+            BasicBlock& Entry = F.getEntryBlock();
+            IRBuilder<> B(&*Entry.getFirstInsertionPt());
+            Value* Name = B.CreateGlobalStringPtr(F.getName(), "cs_fn_name");
+            B.CreateCall(Hit, { Name });
+        }
+        return llvm::PreservedAnalyses::none();
+    }
+};
+
+// Build a reasonable optimization pipeline (O0..O3) and optionally add our IR profiling pass.
+static void cs_run_module_pipeline(llvm::Module& M, const Config& cfg, bool withProfiler) {
+    using namespace llvm;
+    PassBuilder PB;
+    LoopAnalysisManager     LAM;
+    FunctionAnalysisManager FAM;
+    CGSCCAnalysisManager    CGAM;
+    ModuleAnalysisManager   MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    OptimizationLevel O = OptimizationLevel::O2;
+    if (cfg.opt == "O0") O = OptimizationLevel::O0;
+    else if (cfg.opt == "O1") O = OptimizationLevel::O1;
+    else if (cfg.opt == "O2") O = OptimizationLevel::O2;
+    else O = OptimizationLevel::O3;
+
+    ModulePassManager MPM;
+    if (withProfiler) MPM.addPass(CSProfilePass_IR());
+    MPM.addPass(PB.buildPerModuleDefaultPipeline(O));
+    MPM.run(M, MAM);
+}
+
+// Mark hot functions in IR
+static void mark_hot_functions(llvm::Module& M, const std::unordered_set<std::string>& hot) {
+    for (auto& F : M) {
+        if (F.isDeclaration()) continue;
+        if (hot.find(F.getName().str()) != hot.end()) {
+            F.addFnAttr("hot");
+        }
+    }
+}
+
+// Two-pass, IR-only, self-contained build (PGO via cs_prof_hit; no text-level injection; no system cc)
+namespace cs_ironly {
+
+    static int build_two_pass_selfcontained(const Config& cfg,
+        const std::string& lowered_c_noinst,
+        const std::string& outPath,
+        bool echoLogs = false) {
+        try {
+            // Pass 1: compile to IR, add IR profiler, codegen to obj, link to instrumented exe
+            auto mc1 = cs_compile_c_to_module_inproc(lowered_c_noinst, cfg, /*incs*/{}, /*defs*/{ "CS_PROFILE_BUILD=1", cfg.hardline ? "CS_HARDLINE=1" : "" });
+            std::unique_ptr<llvm::Module>& M1 = mc1.first;
+            cs_run_module_pipeline(*M1, cfg, /*withProfiler*/true);
+            auto Obj1 = cs_emit_obj_from_module_LLVM(*M1, cfg);
+
+            // Instrumented exe path
+            std::string exe1;
+#if defined(_WIN32)
+            exe1 = write_temp("cscript_ir_prof.exe", "");
+#else
+            exe1 = write_temp("cscript_ir_prof.out", "");
+#endif
+            rm_file(exe1);
+            if (cs_link_with_lld(cfg, Obj1->getMemBufferRef(), exe1) != 0)
+                return 1;
+
+            // Run instrumented exe and collect counts
+            std::string profPath = write_temp("cscript_profile.txt", "");
+            rm_file(profPath);
+            int rcRun = run_exe_with_env(exe1, "CS_PROFILE_OUT", profPath);
+            if (echoLogs) std::cerr << "[ir-only] instrumented run rc=" << rcRun << "\n";
+
+            // Read counts and choose hot set
+            auto counts = read_profile_counts(profPath);
+            auto hotSet = select_hot_functions(counts, 16);
+            std::unordered_set<std::string> hotIR(hotSet.begin(), hotSet.end());
+
+            // Cleanup temp artifacts
+            rm_file(profPath);
+            rm_file(exe1);
+
+            // Pass 2: compile to IR again (no profiler), mark hot, optimize, codegen, link final exe
+            auto mc2 = cs_compile_c_to_module_inproc(lowered_c_noinst, cfg, /*incs*/{}, /*defs*/{ cfg.hardline ? "CS_HARDLINE=1" : "" });
+            std::unique_ptr<llvm::Module>& M2 = mc2.first;
+            mark_hot_functions(*M2, hotIR);
+            cs_run_module_pipeline(*M2, cfg, /*withProfiler*/false);
+            auto Obj2 = cs_emit_obj_from_module_LLVM(*M2, cfg);
+
+            // Final link (LLD, in-proc)
+            return cs_link_with_lld(cfg, Obj2->getMemBufferRef(), outPath);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[ir-only] error: " << e.what() << "\n";
+            return 1;
+        }
+    }
+
+    // Public: Build from .csc text to final exe in IR-only mode (no text-level instrumentation)
+    static int build_exe_from_csc_ironly(Config cfg,
+        const std::string& srcAll,
+        const std::string& outPath,
+        bool echoLogs = false,
+        bool dumpLoweredC = false) {
+        // Parse directives and produce body (reuse existing helpers)
+        std::vector<std::string> bodyLines;
+        parse_directives_and_collect(srcAll, cfg, bodyLines);
+        std::string body;
+        for (auto& l : bodyLines) { body += l; body.push_back('\n'); }
+
+        // Lowering (no instrumentation anywhere here)
+        std::map<std::string, EnumInfo> enums;
+        std::string enumLowered = lower_enum_bang_and_collect(body, enums);
+        // Exhaustiveness (hardline unchanged)
+        check_exhaustiveness_or_die(body, enums);
+        // Unsafe + match
+        std::string unsafeLowered = lower_unsafe_blocks(enumLowered);
+        std::string matchLowered = lower_match_patterns(unsafeLowered);
+        // Softline (instrument=false, hot set empty; IR will do profiling)
+        std::set<std::string> none;
+        std::string loweredC = prelude(cfg.hardline);
+        loweredC += "\n";
+        loweredC += softline_lower(matchLowered, cfg.softline, none, /*instrument*/false);
+
+        if (dumpLoweredC || cfg.show_c) {
+            std::cerr << "--- lowered C (IR-only) ---\n" << loweredC << "\n--- end ---\n";
+        }
+
+        // If PGO/directive requested, run two-pass IR-only; else single pass IR-only
+        if (cfg.profile) {
+            return build_two_pass_selfcontained(cfg, loweredC, outPath, echoLogs);
+        }
+        else {
+            try {
+                auto mc = cs_compile_c_to_module_inproc(loweredC, cfg, /*incs*/{}, /*defs*/{ cfg.hardline ? "CS_HARDLINE=1" : "" });
+                std::unique_ptr<llvm::Module>& M = mc.first;
+                cs_run_module_pipeline(*M, cfg, /*withProfiler*/false);
+                auto Obj = cs_emit_obj_from_module_LLVM(*M, cfg);
+                return cs_link_with_lld(cfg, Obj->getMemBufferRef(), outPath);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "[ir-only] error: " << e.what() << "\n";
+                return 1;
+            }
+        }
+    }
+
+} // namespace cs_ironly
+
+// Optional IR-only main: define -DCS_ENSURE_IR_ONLY to hard-switch to IR-only, in-proc, self-contained build.
+// This avoids any path that would call a system compiler (gcc/clang/cl).
+#if defined(CS_ENSURE_IR_ONLY)
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "usage: cscriptc [options] file.csc\n";
+        return 1;
+    }
+    Config cfg;
+    std::string inpath, outPath = "a.exe";
+    std::vector<std::string> args; args.reserve(argc);
+    for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "-o" && i + 1 < args.size()) { outPath = args[++i]; }
+        else if (!a.empty() && a[0] == '-' && a.rfind("-O", 0) == 0) cfg.opt = a.substr(1);
+        else if (a == "--no-lto") cfg.lto = false;
+        else if (a == "--strict") { cfg.strict = true; cfg.hardline = true; }
+        else if (a == "--relaxed") cfg.relaxed = true;
+        else if (a == "--show-c") cfg.show_c = true;
+        else if (a == "--profile" || a == "--pgo") cfg.profile = true;
+        else if (!a.empty() && a[0] != '-') inpath = a;
+    }
+    if (inpath.empty()) { std::cerr << "error: missing input .csc file\n"; return 2; }
+    std::string srcAll = read_file(inpath);
+    int rc = cs_ironly::build_exe_from_csc_ironly(cfg, srcAll, outPath, /*echoLogs*/cfg.show_c, /*dumpLoweredC*/cfg.show_c);
+    if (rc == 0) std::cout << outPath << "\n";
+    return rc;
+}
+#endif // CS_ENSURE_IR_ONLY
+
+#else  // !CS_EMBED_LLVM
+
+// Hard guard: if you try to enforce IR-only without embedded LLVM, fail clearly.
+#if defined(CS_ENSURE_IR_ONLY)
+#error "CS_ENSURE_IR_ONLY requires -DCS_EMBED_LLVM and linking LLVM/Clang/LLD. No system toolchain will be used."
+#endif
+
+#endif // CS_EMBED_LLVM
+
+// End of IR-Only Self-Bootstrap Pack
+
