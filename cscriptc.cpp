@@ -1,12 +1,13 @@
-// cscriptc.cpp — C-Script v0.3 reference compiler (front + analyzer + PGO + driver)
+// cscriptc.cpp — C-Script v0.4 reference compiler (front + analyzer + PGO + driver)
 // Build: g++ -std=gnu++17 cscriptc.cpp -o cscriptc      (Linux/macOS, Clang/GCC)
 //     or clang++ -std=c++17 cscriptc.cpp -o cscriptc
 //     or (MSYS/Clang on Windows recommended). MSVC works but needs regex fixes below.
 // Usage:  ./cscriptc file.csc [--show-c] [--strict] [-O{0|1|2|3|max|size}] [-o out.exe]
-// Notes:
-//  - Produces ONE final .exe. Any temps for build/PGO are deleted.
-//  - PGO: when @profile on, we instrument softline `fn` entries, run once, then rebuild with hot attrs.
-//  - Exhaustiveness: compile-time error if a CS_SWITCH_EXHAUSTIVE for an enum! misses any cases.
+// Features:
+//  - Single executable output with optional Profile-Guided Optimization
+//  - Strong static analysis with exhaustiveness checking for enums
+//  - Expressive syntax with softline functions and safety annotations
+//  - Zero-cost abstractions with direct C ABI compatibility
 
 #include <algorithm>
 #include <cctype>
@@ -23,12 +24,15 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <iomanip>   // std::quoted
+#include <iomanip>
+#include <chrono>
+#include <filesystem>
 
 #if defined(_WIN32)
 #include <windows.h>
 #define PATH_SEP '\\'
 #else
+#include <unistd.h>
 #define PATH_SEP '/'
 #endif
 
@@ -39,10 +43,30 @@ using std::map;
 using std::pair;
 
 // ============================================================================
-// Regex wrapper for MSVC iterator + match_results quirks (portable).
-// Avoids ambiguous iterator overloads by scanning from an index.
+// Version information
 // ============================================================================
+constexpr const char* CSCRIPT_VERSION = "0.4.0";
+constexpr const char* CSCRIPT_BUILD_DATE = __DATE__;
 
+// ============================================================================
+// Error handling utilities
+// ============================================================================
+class CompilerError : public std::runtime_error {
+public:
+    CompilerError(const string& msg, int line = 0, int col = 0)
+        : std::runtime_error(msg), line_(line), col_(col) {}
+    
+    int line() const { return line_; }
+    int col() const { return col_; }
+    
+private:
+    int line_;
+    int col_;
+};
+
+// ============================================================================
+// Regex wrapper for MSVC iterator + match_results quirks (portable).
+// ============================================================================
 namespace cs_regex_wrap {
     using cmatch = std::match_results<std::string::const_iterator>;
 
@@ -87,19 +111,40 @@ namespace cs_regex_wrap {
 
 //============================= Config =============================
 struct Config {
-    bool hardline = true;
-    bool softline = true;
-    string opt = "O2";
-    bool lto = true;
-    bool profile = false; // PGO two-pass
-    string out = "a.exe";
-    string abi = "";
-    vector<string> defines, incs, libpaths, links;
-    bool strict = false, relaxed = false, show_c = false;
-    string cc_prefer = "";
+    bool hardline = true;         // Enable runtime checks
+    bool softline = true;         // Enable syntactic sugar
+    string opt = "O2";            // Optimization level
+    bool lto = true;              // Link-time optimization
+    bool profile = false;         // PGO two-pass
+    bool debug = false;           // Include debug symbols
+    string out = "a.exe";         // Output filename
+    string abi = "";              // ABI compatibility
+    vector<string> defines;       // Preprocessor definitions
+    vector<string> incs;          // Include paths
+    vector<string> libpaths;      // Library paths
+    vector<string> links;         // Libraries to link
+    bool strict = false;          // Stricter error checking
+    bool relaxed = false;         // More permissive behavior
+    bool show_c = false;          // Show generated C code
+    bool verbose = false;         // Verbose output
+    string cc_prefer = "";        // Preferred C compiler
+    
+    // New config options
+    bool emit_llvm = false;       // Emit LLVM IR
+    bool warn_as_error = false;   // Treat warnings as errors
+    string target = "";           // Target triple
 };
 
-static bool starts_with(const string& s, const string& p) { return s.rfind(p, 0) == 0; }
+//============================= String utilities =============================
+static bool starts_with(const string& s, const string& p) { 
+    return s.rfind(p, 0) == 0; 
+}
+
+static bool ends_with(const string& s, const string& p) {
+    if (p.size() > s.size()) return false;
+    return s.compare(s.size() - p.size(), p.size(), p) == 0;
+}
+
 static string trim(const string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
     if (a == string::npos) return "";
@@ -107,24 +152,48 @@ static string trim(const string& s) {
     return s.substr(a, b - a + 1);
 }
 
+static vector<string> split(const string& s, char delim) {
+    vector<string> result;
+    std::istringstream iss(s);
+    string item;
+    while (std::getline(iss, item, delim)) {
+        result.push_back(item);
+    }
+    return result;
+}
+
+//============================= File operations =============================
 static string read_file(const string& p) {
     std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open: " + p);
+    if (!f) throw CompilerError("Cannot open file: " + p);
     std::ostringstream ss; ss << f.rdbuf(); return ss.str();
 }
-static string write_temp(const string& base, const string& content) {
+
+static string get_temp_dir() {
     string dir;
 #if defined(_WIN32)
-    char buf[MAX_PATH]; GetTempPathA(MAX_PATH, buf);
+    char buf[MAX_PATH]; 
+    GetTempPathA(MAX_PATH, buf);
     dir = string(buf);
 #else
-    const char* t = getenv("TMPDIR"); dir = t ? t : "/tmp/";
+    const char* t = getenv("TMPDIR"); 
+    dir = t ? t : "/tmp/";
+    if (!dir.empty() && dir.back() != '/') dir += '/';
 #endif
-    string path = dir + base;
-    std::ofstream o(path, std::ios::binary); o << content;
+    return dir;
+}
+
+static string write_temp(const string& base, const string& content) {
+    string path = get_temp_dir() + base;
+    std::ofstream o(path, std::ios::binary); 
+    if (!o) throw CompilerError("Cannot create temporary file: " + path);
+    o << content;
     return path;
 }
-static void rm_file(const string& p) { std::remove(p.c_str()); }
+
+static bool rm_file(const string& p) { 
+    return std::remove(p.c_str()) == 0; 
+}
 
 // For error lines
 static pair<int, int> line_col_at(const string& s, size_t pos) {
@@ -133,66 +202,69 @@ static pair<int, int> line_col_at(const string& s, size_t pos) {
         if (s[i] == '\n') { line++; col = 1; }
         else col++;
     }
-    return { line,col };
+    return { line, col };
 }
 
 //============================= Prelude =============================
 static string prelude(bool hardline) {
     std::ostringstream o;
-    o << R"(// --- C-Script prelude (zero-cost) ---
-#include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
+    o << "// --- C-Script v" << CSCRIPT_VERSION << " prelude (zero-cost) ---\n"
+      << "#include <stdio.h>\n"
+      << "#include <stdint.h>\n"
+      << "#include <stddef.h>\n"
+      << "#include <stdlib.h>\n"
+      << "#include <string.h>\n"
+      << "#include <stdbool.h>\n\n"
+      << "#define print(...) printf(__VA_ARGS__)\n"
+      << "#if defined(__GNUC__) || defined(__clang__)\n"
+      << "  #define likely(x)   __builtin_expect(!!(x),1)\n"
+      << "  #define unlikely(x) __builtin_expect(!!(x),0)\n"
+      << "#else\n"
+      << "  #define likely(x)   (x)\n"
+      << "  #define unlikely(x) (x)\n"
+      << "#endif\n\n";
 
-#define print(...) printf(__VA_ARGS__)
-#if defined(__GNUC__) || defined(__clang__)
-  #define likely(x)   __builtin_expect(!!(x),1)
-  #define unlikely(x) __builtin_expect(!!(x),0)
-#else
-  #define likely(x)   (x)
-  #define unlikely(x) (x)
-#endif
+    // Resource management with defer
+    o << "// ---- Resource management with 'defer' ----\n"
+      << "#define CS_CONCAT2(a,b) a##b\n"
+      << "#define CS_CONCAT(a,b)  CS_CONCAT2(a,b)\n"
+      << "#define defer(body) for (int CS_CONCAT(_cs_defer_, __COUNTER__) = 0; \\\n"
+      << "                         CS_CONCAT(_cs_defer_, __COUNTER__) == 0; \\\n"
+      << "                         (void)(body), CS_CONCAT(_cs_defer_, __COUNTER__)=1)\n\n";
 
-// ---- Tiny 'defer' macro ----
-#define CS_CONCAT2(a,b) a##b
-#define CS_CONCAT(a,b)  CS_CONCAT2(a,b)
-#define CS_DEFER(body) for (int CS_CONCAT(_cs_defer_, __COUNTER__) = 0; \
-                             CS_CONCAT(_cs_defer_, __COUNTER__) == 0; \
-                             (void)(body), CS_CONCAT(_cs_defer_, __COUNTER__)=1)
+    // Exhaustive switch checking
+    o << "// ---- Exhaustive switch helpers ----\n"
+      << "#define CS_SWITCH_EXHAUSTIVE(T, expr) do { int __cs_hit=0; T __cs_v=(expr); switch(__cs_v){\n"
+      << "#define CS_CASE(x) case x: __cs_hit=1\n"
+      << "#define CS_SWITCH_END(T, expr) default: break; } if(!__cs_hit) cs__enum_assert_##T(__cs_v); } while(0)\n\n";
 
-// ---- Exhaustive switch helpers (enum-specific assert is emitted by compiler) ----
-#define CS_SWITCH_EXHAUSTIVE(T, expr) do { int __cs_hit=0; T __cs_v=(expr); switch(__cs_v){
-#define CS_CASE(x) case x: __cs_hit=1
-#define CS_SWITCH_END(T, expr) default: break; } if(!__cs_hit) cs__enum_assert_##T(__cs_v); } while(0)
+    // Unsafe pragmas for disabling conversion warnings
+    o << "// ---- @unsafe pragmas ----\n"
+      << "#if defined(_MSC_VER)\n"
+      << "  #define CS_PRAGMA_PUSH __pragma(warning(push))\n"
+      << "  #define CS_PRAGMA_POP  __pragma(warning(pop))\n"
+      << "  #define CS_PRAGMA_RELAX __pragma(warning(disable:4244 4267 4018 4389))\n"
+      << "#else\n"
+      << "  #define CS_PRAGMA_PUSH _Pragma(\"GCC diagnostic push\")\n"
+      << "  #define CS_PRAGMA_POP  _Pragma(\"GCC diagnostic pop\")\n"
+      << "  #define CS_PRAGMA_RELAX _Pragma(\"GCC diagnostic ignored \\\"-Wconversion\\\"\")\\\n"
+      << "                          _Pragma(\"GCC diagnostic ignored \\\"-Wsign-conversion\\\"\")\\\n"
+      << "                          _Pragma(\"GCC diagnostic ignored \\\"-Wenum-conversion\\\"\")\n"
+      << "#endif\n"
+      << "#define CS_UNSAFE_BEGIN do { CS_PRAGMA_PUSH; CS_PRAGMA_RELAX; } while(0)\n"
+      << "#define CS_UNSAFE_END   do { CS_PRAGMA_POP; } while(0)\n\n";
 
-// ---- @unsafe pragmas ----
-#if defined(_MSC_VER)
-  #define CS_PRAGMA_PUSH __pragma(warning(push))
-  #define CS_PRAGMA_POP  __pragma(warning(pop))
-  #define CS_PRAGMA_RELAX __pragma(warning(disable:4244 4267 4018 4389))
-#else
-  #define CS_PRAGMA_PUSH _Pragma("GCC diagnostic push")
-  #define CS_PRAGMA_POP  _Pragma("GCC diagnostic pop")
-  #define CS_PRAGMA_RELAX _Pragma("GCC diagnostic ignored \"-Wconversion\"") \
-                          _Pragma("GCC diagnostic ignored \"-Wsign-conversion\"") \
-                          _Pragma("GCC diagnostic ignored \"-Wenum-conversion\"")
-#endif
-#define CS_UNSAFE_BEGIN do { CS_PRAGMA_PUSH; CS_PRAGMA_RELAX; } while(0)
-#define CS_UNSAFE_END   do { CS_PRAGMA_POP; } while(0)
+    // Function attributes for PGO
+    o << "// ---- Function attributes for PGO ----\n"
+      << "#if defined(_MSC_VER)\n"
+      << "  #define CS_HOT\n"
+      << "#else\n"
+      << "  #define CS_HOT __attribute__((hot))\n"
+      << "#endif\n";
 
-// ---- CS_HOT for 2nd-pass PGO ----
-#if defined(_MSC_VER)
-  #define CS_HOT
-#else
-  #define CS_HOT __attribute__((hot))
-#endif
-)";
+    if (hardline) o << "\n#define CS_HARDLINE 1\n";
 
-    if (hardline) o << "#define CS_HARDLINE 1\n";
-
-    // Profiler (only compiled into the instrumented pass)
+    // Profiler (only for instrumented pass)
     o << R"(
 #ifdef CS_PROFILE_BUILD
 typedef struct { const char* name; unsigned long long count; } _cs_prof_ent;
@@ -242,7 +314,26 @@ static void cs_prof_hit(const char* name){
 #else
 static void cs_prof_hit(const char*){ /* no-op in optimized pass */ }
 #endif
+
+// ---- Memory management utilities ----
+#ifndef CS_MALLOC
+#define CS_MALLOC malloc
+#endif
+#ifndef CS_FREE
+#define CS_FREE free
+#endif
+#ifndef CS_REALLOC
+#define CS_REALLOC realloc
+#endif
+
+// ---- Result type for error handling ----
+#define Result(T) struct { T value; bool ok; const char* error; }
+#define Ok(x) (typeof(x)){.value = (x), .ok = true, .error = NULL}
+#define Err(msg) {.ok = false, .error = (msg)}
+#define unwrap(result) ((result).ok ? (result).value : (fprintf(stderr, "Runtime error: %s\n", (result).error), exit(1), (result).value))
+#define try(result) do { if (!(result).ok) return Err((result).error); } while(0)
 )";
+
     return o.str();
 }
 
@@ -255,18 +346,61 @@ static void parse_directives_and_collect(const string& in, Config& cfg, vector<s
         if (starts_with(t, "@")) {
             std::istringstream ls(t.substr(1));
             string name; ls >> name;
-            if (name == "hardline") { string v; ls >> v; cfg.hardline = (v != "off"); }
-            else if (name == "softline") { string v; ls >> v; cfg.softline = (v != "off"); }
-            else if (name == "opt") { string v; ls >> v; cfg.opt = v; }
-            else if (name == "lto") { string v; ls >> v; cfg.lto = (v != "off"); }
-            else if (name == "profile") { string v; ls >> v; cfg.profile = (v != "off"); }
-            else if (name == "out") { string v; ls >> std::quoted(v); cfg.out = v; }
-            else if (name == "abi") { string v; ls >> std::quoted(v); cfg.abi = v; }
-            else if (name == "define") { string v; ls >> v; cfg.defines.push_back(v); }
-            else if (name == "inc") { string v; ls >> std::quoted(v); cfg.incs.push_back(v); }
-            else if (name == "libpath") { string v; ls >> std::quoted(v); cfg.libpaths.push_back(v); }
-            else if (name == "link") { string v; ls >> std::quoted(v); cfg.links.push_back(v); }
-            else { std::cerr << "warning: unknown directive @" << name << "\n"; }
+            if (name == "hardline") { 
+                string v; ls >> v; 
+                cfg.hardline = (v != "off"); 
+            }
+            else if (name == "softline") { 
+                string v; ls >> v; 
+                cfg.softline = (v != "off"); 
+            }
+            else if (name == "opt") { 
+                string v; ls >> v; 
+                cfg.opt = v; 
+            }
+            else if (name == "lto") { 
+                string v; ls >> v; 
+                cfg.lto = (v != "off"); 
+            }
+            else if (name == "profile") { 
+                string v; ls >> v; 
+                cfg.profile = (v != "off"); 
+            }
+            else if (name == "debug") { 
+                string v; ls >> v; 
+                cfg.debug = (v != "off"); 
+            }
+            else if (name == "out") { 
+                string v; ls >> std::quoted(v); 
+                cfg.out = v; 
+            }
+            else if (name == "abi") { 
+                string v; ls >> std::quoted(v); 
+                cfg.abi = v; 
+            }
+            else if (name == "define") { 
+                string v; ls >> v; 
+                cfg.defines.push_back(v); 
+            }
+            else if (name == "inc") { 
+                string v; ls >> std::quoted(v); 
+                cfg.incs.push_back(v); 
+            }
+            else if (name == "libpath") { 
+                string v; ls >> std::quoted(v); 
+                cfg.libpaths.push_back(v); 
+            }
+            else if (name == "link") { 
+                string v; ls >> std::quoted(v); 
+                cfg.links.push_back(v); 
+            }
+            else if (name == "target") { 
+                string v; ls >> std::quoted(v); 
+                cfg.target = v; 
+            }
+            else { 
+                std::cerr << "warning: unknown directive @" << name << "\n"; 
+            }
             continue;
         }
         body.push_back(line);
@@ -274,19 +408,25 @@ static void parse_directives_and_collect(const string& in, Config& cfg, vector<s
 }
 
 //============================= enum! parsing + emission =============================
-struct EnumInfo { set<string> members; };
+struct EnumInfo { 
+    set<string> members; 
+    bool is_flags = false;
+};
 
 static string lower_enum_bang_and_collect(const string& in, map<string, EnumInfo>& enums) {
     using namespace cs_regex_wrap;
 
     string s = in;
-    std::regex re(R"(enum!\s+([A-Za-z_]\w*)\s*\{([^}]*)\})");
+    // Match standard enum! and enum_flags!
+    std::regex re_standard(R"(enum!\s+([A-Za-z_]\w*)\s*\{([^}]*)\})");
+    std::regex re_flags(R"(enum_flags!\s+([A-Za-z_]\w*)\s*\{([^}]*)\})");
+    
     cmatch m;
-
-    string out; out.reserve(s.size() * 12 / 10);
+    string out; 
+    out.reserve(s.size() * 12 / 10);
     size_t pos = 0;
 
-    auto split_enums = [](string body)->vector<string> {
+    auto split_enums = [](string body) -> vector<string> {
         vector<string> names;
         string token;
         auto flush = [&]() {
@@ -297,22 +437,24 @@ static string lower_enum_bang_and_collect(const string& in, map<string, EnumInfo
                 if (!ident.empty()) names.push_back(ident);
             }
             token.clear();
-            };
+        };
         for (char c : body) {
             if (c == ',') flush();
             else token.push_back(c);
         }
         flush();
         return names;
-        };
+    };
 
-    while (search_from(s, pos, m, re)) {
-        append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m); // safe: we append up to match prefix
+    // Process standard enums
+    while (search_from(s, pos, m, re_standard)) {
+        append_prefix(out, s, pos - (m.length(0) ? m.length(0) : 0), m);
 
         string name = m[1].str();
         string body = m[2].str();
         vector<string> items = split_enums(body);
         EnumInfo info;
+        info.is_flags = false;
         for (auto& id : items) info.members.insert(id);
         enums[name] = info;
 
@@ -331,16 +473,38 @@ static string lower_enum_bang_and_collect(const string& in, map<string, EnumInfo
             "  (void)v;\n"
             "#endif\n"
             "}\n";
-        // pos has already advanced by search_from to suffix start
     }
+
+    // Reset position to search for flag enums
+    pos = 0;
+    string s2 = out;
+    out.clear();
+    out.reserve(s2.size() * 12 / 10);
+
+    // Process flag enums (bitfield enums)
+    while (search_from(s2, pos, m, re_flags)) {
+        append_prefix(out, s2, pos - (m.length(0) ? m.length(0) : 0), m);
+
+        string name = m[1].str();
+        string body = m[2].str();
+        vector<string> items = split_enums(body);
+        EnumInfo info;
+        info.is_flags = true;
+        for (auto& id : items) info.members.insert(id);
+        enums[name] = info;
+
+        // Emit flag enum as C typedef with bitwise operations helpers
+        out += "typedef enum " + name + " { " + body + " } " + name + ";\n";
+        out += "static inline " + name + " " + name + "_combine(" + name + " a, " + name + " b) { return (" + name + ")(a | b); }\n";
+        out += "static inline bool " + name + "_has(" + name + " flags, " + name + " flag) { return (flags & flag) == flag; }\n";
+    }
+
     // Append tail
-    out.append(s, pos, string::npos);
+    out.append(s2, pos, string::npos);
     return out;
 }
 
 //============================= Compile-time switch exhaustiveness =============================
-struct SwitchSite { string type; set<string> cases; size_t startPos = 0; };
-
 static void check_exhaustiveness_or_die(const string& src,
     const map<string, EnumInfo>& enums) {
     using namespace cs_regex_wrap;
@@ -363,9 +527,7 @@ static void check_exhaustiveness_or_die(const string& src,
         size_t b = src.find(endKey, q);
         if (b == string::npos) {
             auto lc = line_col_at(src, a);
-            std::cerr << "error: unmatched CS_SWITCH_EXHAUSTIVE for '" << Type
-                << "' at " << lc.first << ":" << lc.second << "\n";
-            exit(1);
+            throw CompilerError("Unmatched CS_SWITCH_EXHAUSTIVE for '" + Type + "'", lc.first, lc.second);
         }
         // Extract region between a..b for cases
         string region = src.substr(a, b - a);
@@ -381,16 +543,21 @@ static void check_exhaustiveness_or_die(const string& src,
         // Compare with enum set if exists
         auto itE = enums.find(Type);
         if (itE != enums.end()) {
+            // Skip flags enum - they don't require exhaustiveness checking
+            if (itE->second.is_flags) {
+                i = b + 1;
+                continue;
+            }
+            
             const auto& universe = itE->second.members;
             vector<string> missing;
             for (const auto& e : universe) if (!seen.count(e)) missing.push_back(e);
             if (!missing.empty()) {
                 auto lc = line_col_at(src, a);
-                std::cerr << "error: non-exhaustive switch for enum '" << Type
-                    << "' at " << lc.first << ":" << lc.second << ". Missing:";
-                for (auto& mname : missing) std::cerr << " " << mname;
-                std::cerr << "\n";
-                exit(1);
+                std::ostringstream err;
+                err << "Non-exhaustive switch for enum '" << Type << "'. Missing:";
+                for (auto& mname : missing) err << " " << mname;
+                throw CompilerError(err.str(), lc.first, lc.second);
             }
         }
         i = b + 1;
@@ -544,39 +711,66 @@ static string build_cmd(const Config& cfg, const string& cc, const string& cpath
         else if (cfg.opt == "O1") cmd.push_back("/O1");
         else if (cfg.opt == "O2") cmd.push_back("/O2");
         else if (cfg.opt == "O3" || cfg.opt == "max") cmd.push_back("/O2");
+        else if (cfg.opt == "size") cmd.push_back("/Os");
+        
+        if (cfg.debug) cmd.push_back("/Zi");
         if (cfg.hardline || cfg.strict) { cmd.push_back("/Wall"); cmd.push_back("/WX"); }
         if (cfg.lto) cmd.push_back("/GL");
         if (cfg.hardline) cmd.push_back("/DCS_HARDLINE=1");
         if (defineProfile) cmd.push_back("/DCS_PROFILE_BUILD=1");
+        
         for (auto& d : cfg.defines) cmd.push_back("/D" + d);
         for (auto& p : cfg.incs)    cmd.push_back("/I" + p);
+        
         cmd.push_back(cpath);
         cmd.push_back("/Fe:" + out);
+        
+        if (cfg.debug) cmd.push_back("/Fd:" + out + ".pdb");
+        
         for (auto& lp : cfg.libpaths) cmd.push_back("/link /LIBPATH:\"" + lp + "\"");
         for (auto& l : cfg.links) {
-            string lib = l; if (lib.rfind(".lib") == string::npos) lib += ".lib";
+            string lib = l; 
+            if (lib.rfind(".lib") == string::npos) lib += ".lib";
             cmd.push_back("/link " + lib);
         }
     }
     else {
         cmd.push_back("-std=c11");
+        
         if (cfg.opt == "O0") cmd.push_back("-O0");
         else if (cfg.opt == "O1") cmd.push_back("-O1");
         else if (cfg.opt == "O2") cmd.push_back("-O2");
         else if (cfg.opt == "O3") cmd.push_back("-O3");
         else if (cfg.opt == "size") cmd.push_back("-Os");
         else if (cfg.opt == "max") { cmd.push_back("-O3"); if (cfg.lto) cmd.push_back("-flto"); }
+        
+        if (cfg.debug) cmd.push_back("-g");
+        
         if (cfg.hardline) {
-            cmd.push_back("-Wall"); cmd.push_back("-Wextra"); cmd.push_back("-Werror");
-            cmd.push_back("-Wconversion"); cmd.push_back("-Wsign-conversion");
+            cmd.push_back("-Wall"); 
+            cmd.push_back("-Wextra"); 
+            if (cfg.warn_as_error) cmd.push_back("-Werror");
+            cmd.push_back("-Wconversion"); 
+            cmd.push_back("-Wsign-conversion");
         }
+        
         if (cfg.lto) cmd.push_back("-flto");
+        
+        if (!cfg.target.empty()) {
+            cmd.push_back("-target");
+            cmd.push_back(cfg.target);
+        }
+        
         if (cfg.hardline) cmd.push_back("-DCS_HARDLINE=1");
         if (defineProfile) cmd.push_back("-DCS_PROFILE_BUILD=1");
+        
         for (auto& d : cfg.defines) { cmd.push_back("-D" + d); }
         for (auto& p : cfg.incs) { cmd.push_back("-I" + p); }
+        
         cmd.push_back(cpath);
-        cmd.push_back("-o"); cmd.push_back(out);
+        cmd.push_back("-o"); 
+        cmd.push_back(out);
+        
         for (auto& lp : cfg.libpaths) { cmd.push_back("-L" + lp); }
         for (auto& l : cfg.links) { cmd.push_back("-l" + l); }
     }
@@ -606,6 +800,7 @@ static map<string, unsigned long long> read_profile_counts(const string& path) {
     while (f >> name >> cnt) { m[name] += cnt; }
     return m;
 }
+
 static set<string> select_hot_functions(const map<string, unsigned long long>& m, size_t topN = 16) {
     vector<pair<string, unsigned long long>> v(m.begin(), m.end());
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
@@ -619,100 +814,188 @@ static set<string> select_hot_functions(const map<string, unsigned long long>& m
 //============================= MAIN =============================
 int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
-    if (argc < 2) { std::cerr << "usage: cscriptc [options] file.csc\n"; return 1; }
-
-    Config cfg;
-    string inpath;
-    vector<string> args; args.reserve(argc);
-    for (int i = 1; i < argc; i++) args.push_back(argv[i]);
-    for (size_t i = 0; i < args.size(); ++i) {
-        string a = args[i];
-        if (a == "-o" && i + 1 < args.size()) { cfg.out = args[++i]; }
-        else if (starts_with(a, "-O")) { cfg.opt = a.substr(1); }
-        else if (a == "--no-lto") { cfg.lto = false; }
-        else if (a == "--strict") { cfg.strict = true; cfg.hardline = true; }
-        else if (a == "--relaxed") { cfg.relaxed = true; }
-        else if (a == "--show-c") { cfg.show_c = true; }
-        else if (a == "--cc" && i + 1 < args.size()) { cfg.cc_prefer = args[++i]; }
-        else if (!a.empty() && a[0] != '-') { inpath = a; }
+    if (argc < 2) { 
+        std::cerr << "C-Script Compiler v" << CSCRIPT_VERSION << " (" << CSCRIPT_BUILD_DATE << ")\n"
+                  << "Usage: cscriptc [options] file.csc\n"
+                  << "Options:\n"
+                  << "  -o <file>       Output file name\n"
+                  << "  -O<level>       Optimization level (0,1,2,3,size,max)\n"
+                  << "  --no-lto        Disable link-time optimization\n"
+                  << "  --strict        Enable strict error checking\n"
+                  << "  --relaxed       More permissive behavior\n"
+                  << "  --show-c        Show generated C code\n"
+                  << "  --verbose       Verbose output\n"
+                  << "  --cc <compiler> Specify C compiler\n"
+                  << "  --debug         Include debug information\n"
+                  << "  --target <triple> Set compilation target\n";
+        return 1;
     }
-    if (inpath.empty()) { std::cerr << "error: missing input .csc file\n"; return 2; }
 
-    // Read & split into directives + body
-    string srcAll = read_file(inpath);
-    vector<string> bodyLines;
-    parse_directives_and_collect(srcAll, cfg, bodyLines);
-    string body;
-    body.reserve(srcAll.size());
-    for (auto& l : bodyLines) { body += l; body.push_back('\n'); }
+    try {
+        Config cfg;
+        string inpath;
+        vector<string> args; args.reserve(argc);
+        for (int i = 1; i < argc; i++) args.push_back(argv[i]);
+        for (size_t i = 0; i < args.size(); ++i) {
+            string a = args[i];
+            if (a == "-o" && i + 1 < args.size()) { cfg.out = args[++i]; }
+            else if (starts_with(a, "-O")) { cfg.opt = a.substr(1); }
+            else if (a == "--no-lto") { cfg.lto = false; }
+            else if (a == "--strict") { cfg.strict = true; cfg.hardline = true; }
+            else if (a == "--relaxed") { cfg.relaxed = true; }
+            else if (a == "--show-c") { cfg.show_c = true; }
+            else if (a == "--verbose") { cfg.verbose = true; }
+            else if (a == "--debug") { cfg.debug = true; }
+            else if (a == "--cc" && i + 1 < args.size()) { cfg.cc_prefer = args[++i]; }
+            else if (a == "--target" && i + 1 < args.size()) { cfg.target = args[++i]; }
+            else if (a == "--warn-as-error") { cfg.warn_as_error = true; }
+            else if (!a.empty() && a[0] != '-') { inpath = a; }
+        }
+        if (inpath.empty()) { throw CompilerError("Missing input .csc file"); }
 
-    // 1) Analyze enum! and emit typedefs + helpers; collect enum members
-    map<string, EnumInfo> enums;
-    string enumLowered = lower_enum_bang_and_collect(body, enums);
+        // Show compilation info if verbose
+        if (cfg.verbose) {
+            std::cerr << "C-Script Compiler v" << CSCRIPT_VERSION << "\n"
+                      << "Input: " << inpath << "\n"
+                      << "Output: " << cfg.out << "\n"
+                      << "Optimization: " << cfg.opt << (cfg.lto ? " with LTO" : "") << "\n";
+        }
 
-    // 2) Compile-time switch exhaustiveness checks against enum!
-    check_exhaustiveness_or_die(body, enums); // analyze original macros in 'body'
+        // Auto-set output name if not specified
+        if (cfg.out == "a.exe" && !inpath.empty()) {
+            string basename = inpath;
+            size_t lastSlash = basename.find_last_of("/\\");
+            if (lastSlash != string::npos) basename = basename.substr(lastSlash + 1);
+            
+            size_t lastDot = basename.find_last_of(".");
+            if (lastDot != string::npos) basename = basename.substr(0, lastDot);
+            
+#if defined(_WIN32)
+            cfg.out = basename + ".exe";
+#else
+            cfg.out = basename + ".out";
+#endif
+        }
 
-    // 3) Lower @unsafe blocks
-    string unsafeLowered = lower_unsafe_blocks(enumLowered);
+        auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 4) PGO two-pass (optional)
-    set<string> hotFns; // selected after pass 1
-    string cc = pick_cc(cfg.cc_prefer);
+        // Read & split into directives + body
+        string srcAll = read_file(inpath);
+        vector<string> bodyLines;
+        parse_directives_and_collect(srcAll, cfg, bodyLines);
+        string body;
+        body.reserve(srcAll.size());
+        for (auto& l : bodyLines) { body += l; body.push_back('\n'); }
 
-    auto build_once = [&](const string& c_src, const string& out, bool profileBuild)->int {
-        string cpath = write_temp(string("cscript_") + std::to_string(uintptr_t(&cfg)) + ".c", c_src);
-        string cmd = build_cmd(cfg, cc, cpath, out, profileBuild);
-        if (cfg.show_c) { std::cerr << "--- generated C ---\n" << c_src << "\n--- end ---\n"; }
-        int rc = run_cmd(cmd, cfg.show_c);
-        if (!cfg.show_c) rm_file(cpath);
-        return rc;
+        // 1) Analyze enum! and emit typedefs + helpers; collect enum members
+        map<string, EnumInfo> enums;
+        string enumLowered = lower_enum_bang_and_collect(body, enums);
+
+        // 2) Compile-time switch exhaustiveness checks against enum!
+        check_exhaustiveness_or_die(body, enums); // analyze original macros in 'body'
+
+        // 3) Lower @unsafe blocks
+        string unsafeLowered = lower_unsafe_blocks(enumLowered);
+
+        // 4) PGO two-pass (optional)
+        set<string> hotFns; // selected after pass 1
+        string cc = pick_cc(cfg.cc_prefer);
+
+        auto build_once = [&](const string& c_src, const string& out, bool profileBuild) -> int {
+            string cpath = write_temp(string("cscript_") + std::to_string(uintptr_t(&cfg)) + ".c", c_src);
+            string cmd = build_cmd(cfg, cc, cpath, out, profileBuild);
+            if (cfg.show_c) { 
+                std::cerr << "--- Generated C ---\n" << c_src << "\n--- End ---\n"; 
+            }
+            if (cfg.verbose) {
+                std::cerr << "Building with command:\n" << cmd << "\n";
+            }
+            int rc = run_cmd(cmd, cfg.verbose);
+            if (!cfg.show_c) rm_file(cpath);
+            return rc;
         };
 
-    if (cfg.profile) {
-        // First pass: instrument softline fns and build temp exe
-        string s1 = prelude(cfg.hardline);
-        string inst = softline_lower(unsafeLowered, cfg.softline, /*hot*/{}, /*instrument*/true);
-        s1 += "\n"; s1 += inst;
+        if (cfg.profile) {
+            // First pass: instrument softline fns and build temp exe
+            string s1 = prelude(cfg.hardline);
+            string inst = softline_lower(unsafeLowered, cfg.softline, /*hot*/{}, /*instrument*/true);
+            s1 += "\n"; s1 += inst;
 
-        string tempExeProfile;
+            if (cfg.verbose) {
+                std::cerr << "Building instrumented version for profile-guided optimization...\n";
+            }
+
+            string tempExeProfile;
 #if defined(_WIN32)
-        tempExeProfile = write_temp("cscript_prof.exe", "");
-        rm_file(tempExeProfile); // unique path; build will recreate
+            tempExeProfile = write_temp("cscript_prof.exe", "");
+            rm_file(tempExeProfile); // unique path; build will recreate
 #else
-        tempExeProfile = write_temp("cscript_prof.out", "");
-        rm_file(tempExeProfile);
+            tempExeProfile = write_temp("cscript_prof.out", "");
+            rm_file(tempExeProfile);
 #endif
-        if (build_once(s1, tempExeProfile, /*defineProfile*/true) != 0) {
-            std::cerr << "build failed (instrumented pass)\n"; return 3;
+            if (build_once(s1, tempExeProfile, /*defineProfile*/true) != 0) {
+                throw CompilerError("Build failed (instrumented pass)");
+            }
+
+            // Run once with profile output file
+            if (cfg.verbose) {
+                std::cerr << "Running instrumented executable to collect profile data...\n";
+            }
+            
+            string profPath = write_temp("cscript_profile.txt", "");
+            rm_file(profPath);
+            int rcRun = run_exe_with_env(tempExeProfile, "CS_PROFILE_OUT", profPath);
+            if (rcRun != 0) {
+                std::cerr << "warning: instrumented run returned " << rcRun << "; proceeding\n";
+            }
+            
+            // Read profile and select hot functions
+            auto counts = read_profile_counts(profPath);
+            hotFns = select_hot_functions(counts, 16);
+            
+            if (cfg.verbose) {
+                std::cerr << "Selected " << hotFns.size() << " hot functions for optimization\n";
+            }
+            
+            rm_file(profPath);
+            rm_file(tempExeProfile);
         }
 
-        // Run once with profile output file
-        string profPath = write_temp("cscript_profile.txt", "");
-        rm_file(profPath);
-        int rcRun = run_exe_with_env(tempExeProfile, "CS_PROFILE_OUT", profPath);
-        if (rcRun != 0) {
-            std::cerr << "warning: instrumented run returned " << rcRun << "; proceeding\n";
+        // 5) Final lowering with hot attributes, no instrumentation
+        string csrc = prelude(cfg.hardline);
+        string lowered = softline_lower(unsafeLowered, cfg.softline, hotFns, /*instrument*/false);
+        csrc += "\n"; csrc += lowered;
+
+        // 6) Final build to single exe
+        if (cfg.verbose) {
+            std::cerr << "Building final executable...\n";
         }
-        // Read profile and select hot functions
-        auto counts = read_profile_counts(profPath);
-        hotFns = select_hot_functions(counts, 16);
-        rm_file(profPath);
-        rm_file(tempExeProfile);
+        
+        if (build_once(csrc, cfg.out, /*defineProfile*/false) != 0) {
+            throw CompilerError("Build failed");
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+        if (cfg.verbose) {
+            std::cerr << "Build completed in " << duration << "ms\n";
+        }
+
+        std::cout << cfg.out << "\n";
+        return 0;
+        
+    } catch (const CompilerError& e) {
+        if (e.line() > 0) {
+            std::cerr << "error:" << e.line() << ":" << e.col() << ": " << e.what() << "\n";
+        } else {
+            std::cerr << "error: " << e.what() << "\n";
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << "\n";
+        return 1;
     }
-
-    // 5) Final lowering with hot attributes, no instrumentation
-    string csrc = prelude(cfg.hardline);
-    string lowered = softline_lower(unsafeLowered, cfg.softline, hotFns, /*instrument*/false);
-    csrc += "\n"; csrc += lowered;
-
-    // 6) Final build to single exe
-    if (build_once(csrc, cfg.out, /*defineProfile*/false) != 0) {
-        std::cerr << "build failed\n"; return 4;
-    }
-
-    std::cout << cfg.out << "\n";
-    return 0;
 }
 
 // ============================================================================
@@ -792,6 +1075,14 @@ static void cs_apply_codegen_opts(clang::CodeGenOptions& CGO, const Config& cfg)
     else if (cfg.opt == "O1") CGO.OptimizationLevel = 1;
     else if (cfg.opt == "O2") CGO.OptimizationLevel = 2;
     else /*O3/max/size*/   CGO.OptimizationLevel = 3;
+    
+    if (cfg.debug) {
+        CGO.setDebugInfo(clang::codegenoptions::FullDebugInfo);
+    }
+    
+    if (cfg.lto) {
+        CGO.EmitLLVMUsableTypeMetadata = 1;
+    }
 }
 
 // ---- Build an in-memory Clang CompilerInstance that emits an object buffer
@@ -828,9 +1119,9 @@ cs_compile_c_to_obj_inproc(const std::string& c_source,
     LO.C99 = 1;
     LO.GNUMode = 1;
 
-    // Target triple: host
+    // Target triple: host or specified
     std::shared_ptr<clang::TargetOptions> TO = std::make_shared<clang::TargetOptions>();
-    TO->Triple = llvm::sys::getDefaultTargetTriple();
+    TO->Triple = cfg.target.empty() ? llvm::sys::getDefaultTargetTriple() : cfg.target;
     Inv->setTargetOpts(*TO);
 
     // Header search / preprocessor
@@ -839,12 +1130,6 @@ cs_compile_c_to_obj_inproc(const std::string& c_source,
     HeaderSearchOptions& HS = Inv->getHeaderSearchOpts();
     for (auto& p : incs) HS.AddPath(p, frontend::Angled, false, false);
 
-    // CodeGen / Frontend
-    CodeGenOptions& CGO = Inv->getCodeGenOpts();
-    cs_apply_codegen_opts(CGO, cfg);
-    if (cfg.lto) {
-        CGO.EmitLLVMUsableTypeMetadata = 1;
-    }
     Inv->getFrontendOpts().Inputs.clear();
     Inv->getFrontendOpts().ProgramAction = frontend::EmitObj;
     Inv->getFrontendOpts().Inputs.emplace_back("input.c", clang::Language::C);
@@ -901,11 +1186,28 @@ static int cs_link_with_lld(const Config& cfg,
     args.push_back(tmpObj.c_str());
     args.push_back("/SUBSYSTEM:CONSOLE");
     args.push_back("/ENTRY:mainCRTStartup");
+    
+    if (cfg.debug) {
+        args.push_back("/DEBUG");
+        args.push_back("/DEBUGTYPE:CV");
+    }
+    
     std::vector<std::string> hold;
-    for (auto& lp : cfg.libpaths) { hold.push_back(std::string("/LIBPATH:") + lp); args.push_back(hold.back().c_str()); }
-    for (auto& l : cfg.links) { std::string lib = l; if (lib.rfind(".lib") == std::string::npos) lib += ".lib"; hold.push_back(lib); args.push_back(hold.back().c_str()); }
+    for (auto& lp : cfg.libpaths) { 
+        hold.push_back(std::string("/LIBPATH:") + lp); 
+        args.push_back(hold.back().c_str()); 
+    }
+    
+    for (auto& l : cfg.links) { 
+        std::string lib = l; 
+        if (lib.rfind(".lib") == std::string::npos) lib += ".lib"; 
+        hold.push_back(lib); 
+        args.push_back(hold.back().c_str()); 
+    }
+    
     hold.push_back("/defaultlib:msvcrt");
     args.push_back(hold.back().c_str());
+    
     if (lld::coff::link(args, /*canExitEarly*/ false, llvm::outs(), llvm::errs()))
         rc = 0;
 
@@ -915,10 +1217,24 @@ static int cs_link_with_lld(const Config& cfg,
     args.push_back("ld64.lld");
     args.push_back("-o"); args.push_back(outPath.c_str());
     args.push_back(tmpObj.c_str());
+    
+    if (cfg.debug) {
+        args.push_back("-g");
+    }
+    
     std::vector<std::string> hold;
-    for (auto& lp : cfg.libpaths) { hold.push_back(std::string("-L") + lp); args.push_back(hold.back().c_str()); }
-    for (auto& l : cfg.links) { hold.push_back(std::string("-l") + l);  args.push_back(hold.back().c_str()); }
+    for (auto& lp : cfg.libpaths) { 
+        hold.push_back(std::string("-L") + lp); 
+        args.push_back(hold.back().c_str()); 
+    }
+    
+    for (auto& l : cfg.links) { 
+        hold.push_back(std::string("-l") + l);  
+        args.push_back(hold.back().c_str()); 
+    }
+    
     args.push_back("-lSystem");
+    
     if (lld::macho::link(args, /*canExitEarly*/ false, llvm::outs(), llvm::errs()))
         rc = 0;
 
@@ -929,9 +1245,20 @@ static int cs_link_with_lld(const Config& cfg,
     args.push_back("-o"); args.push_back(outPath.c_str());
     args.push_back(tmpObj.c_str());
 
+    if (cfg.debug) {
+        args.push_back("-g");
+    }
+
     std::vector<std::string> hold;
-    for (auto& lp : cfg.libpaths) { hold.push_back(std::string("-L") + lp); args.push_back(hold.back().c_str()); }
-    for (auto& l : cfg.links) { hold.push_back(std::string("-l") + l);  args.push_back(hold.back().c_str()); }
+    for (auto& lp : cfg.libpaths) { 
+        hold.push_back(std::string("-L") + lp); 
+        args.push_back(hold.back().c_str()); 
+    }
+    
+    for (auto& l : cfg.links) { 
+        hold.push_back(std::string("-l") + l);  
+        args.push_back(hold.back().c_str()); 
+    }
 
     const char* dl_candidates[] = {
       "/lib64/ld-linux-x86-64.so.2",
@@ -939,6 +1266,7 @@ static int cs_link_with_lld(const Config& cfg,
       "/lib64/ld-linux-aarch64.so.1",
       "/lib/ld-linux-aarch64.so.1"
     };
+    
     for (auto* d : dl_candidates) {
         if (llvm::sys::fs::exists(d)) {
             args.push_back("--dynamic-linker");
@@ -1251,3 +1579,4 @@ static int cs_build_once_embed_profile_irpass(const Config& cfg,
 // Final pass already uses embedded path via CS_BUILD_ONCE_FINAL defined earlier
 
 #endif // CS_EMBED_LLVM && CS_PGO_EMBED
+
