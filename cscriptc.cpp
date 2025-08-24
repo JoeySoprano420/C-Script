@@ -888,8 +888,14 @@ int main(int argc, char** argv) {
         for (auto& l : bodyLines) { body += l; body.push_back('\n'); }
 
         // 1) Analyze enum! and emit typedefs + helpers; collect enum members
+        if (cfg.verbose) {
+            std::cerr << "Processing enum! declarations...\n";
+        }
         map<string, EnumInfo> enums;
         string enumLowered = lower_enum_bang_and_collect(body, enums);
+        if (cfg.verbose) {
+            std::cerr << "Found " << enums.size() << " enum types\n";
+        }
 
         // 2) Compile-time switch exhaustiveness checks against enum!
         check_exhaustiveness_or_die(body, enums); // analyze original macros in 'body'
@@ -991,10 +997,10 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "error: " << e.what() << "\n";
         }
-        return 1;
+        return 1;  // Returns 1 for CompilerError
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
-        return 1;
+        return 1;  // Returns 1 for standard exceptions
     }
 }
 
@@ -1120,15 +1126,15 @@ cs_compile_c_to_obj_inproc(const std::string& c_source,
     LO.GNUMode = 1;
 
     // Target triple: host or specified
-    std::shared_ptr<clang::TargetOptions> TO = std::make_shared<clang::TargetOptions>();
-    TO->Triple = cfg.target.empty() ? llvm::sys::getDefaultTargetTriple() : cfg.target;
-    Inv->setTargetOpts(*TO);
+    auto targetOpts = std::make_shared<clang::TargetOptions>();
+    targetOpts->Triple = cfg.target.empty() ? llvm::sys::getDefaultTargetTriple() : cfg.target;
+    Inv->setTargetOpts(*targetOpts);
 
     // Header search / preprocessor
     PreprocessorOptions& PP = Inv->getPreprocessorOpts();
-    for (auto& d : defines) PP.addMacroDef(d);
+    for (auto& d : cfg.defines) PP.addMacroDef(d);
     HeaderSearchOptions& HS = Inv->getHeaderSearchOpts();
-    for (auto& p : incs) HS.AddPath(p, frontend::Angled, false, false);
+    for (auto& p : cfg.incs) HS.AddPath(p, frontend::Angled, false, false);
 
     Inv->getFrontendOpts().Inputs.clear();
     Inv->getFrontendOpts().ProgramAction = frontend::EmitObj;
@@ -1289,185 +1295,79 @@ static int cs_link_with_lld(const Config& cfg,
 static int build_once_llvm_inproc(const Config& cfg,
     const std::string& c_src,
     const std::string& outPath) {
+    using namespace llvm;
+
     std::vector<std::string> incs = cfg.incs;
     std::vector<std::string> defs = cfg.defines;
     if (cfg.hardline) defs.push_back("CS_HARDLINE=1");
 
-    auto ObjBuf = cs_compile_c_to_obj_inproc(c_src, cfg, incs, defs);
-
-    int rc = cs_link_with_lld(cfg, ObjBuf->getMemBufferRef(), outPath);
-    if (rc != 0) {
-        llvm::WithColor::error(llvm::errs(), "lld") << "link failed for " << outPath << "\n";
-        return 1;
-    }
-    return 0;
-}
-
-// Helper that mirrors the earlier signature & behavior
-static int cs_build_once_embed(const Config& cfg,
-    const std::string& c_src,
-    const std::string& outPath,
-    bool /*profileDefineUnusedHere*/) {
-    try {
-        return build_once_llvm_inproc(cfg, c_src, outPath);
-    }
-    catch (const std::exception& e) {
-        std::cerr << "embed-LLVM build error: " << e.what() << "\n";
-        return 1;
-    }
-}
-
-#ifdef CS_PGO_EMBED
-#define CS_BUILD_ONCE_PROFILE(cfg, c_src, outTmp) cs_build_once_embed(cfg, c_src, outTmp, true)
-#else
-#define CS_BUILD_ONCE_PROFILE(cfg, c_src, outTmp) build_once(c_src, outTmp, /*defineProfile*/true)
-#endif
-
-#define CS_BUILD_ONCE_FINAL(cfg, c_src, outPath) cs_build_once_embed(cfg, c_src, outPath, false)
-
-#endif // CS_EMBED_LLVM
-
-// ============================================================================
-// ======  FULL IR-LEVEL COUNTER PASS (100% in-proc profiling, no toolchain) ==
-// ============================================================================
-// Enable together with embedded LLVM:
-//   -DCS_EMBED_LLVM=1 -DCS_PGO_EMBED=1
-// and link against LLVM/Clang/LLD as shown above.
-
-#if defined(CS_EMBED_LLVM) && defined(CS_PGO_EMBED)
-
-#include <memory>
-#include <utility>
-
-#include "llvm/ADT/Triple.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/PassManager.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/MC/TargetRegistry.h"
-#include "llvm/Support/Host.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Support/SmallVectorMemoryBuffer.h"
-#include "llvm/Support/WithColor.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOptions.h"
-#include "llvm/Transforms/Utils/ModuleUtils.h"
-
-#include "clang/Frontend/CompilerInstance.h"
-#include "clang/Frontend/CompilerInvocation.h"
-#include "clang/Frontend/FrontendActions.h"
-#include "clang/Frontend/TextDiagnosticPrinter.h"
-#include "clang/Basic/Diagnostic.h"
-#include "clang/Basic/DiagnosticOptions.h"
-#include "clang/Basic/LangOptions.h"
-#include "clang/Basic/TargetInfo.h"
-#include "clang/Lex/PreprocessorOptions.h"
-#include "clang/Serialization/PCHContainerOperations.h"
-
-// ---- Compile C text to LLVM Module in-process (instead of straight object)
-static std::pair<std::unique_ptr<llvm::Module>, std::unique_ptr<llvm::LLVMContext>>
-cs_compile_c_to_module_inproc(const std::string& c_source,
-    const Config& cfg,
-    const std::vector<std::string>& incs,
-    const std::vector<std::string>& defines) {
-    using namespace clang;
-    using namespace llvm;
-
-    static bool inited = false;
-    if (!inited) {
-        InitializeAllTargets();
-        InitializeAllTargetMCs();
-        InitializeAllAsmParsers();
-        InitializeAllAsmPrinters();
-        inited = true;
-    }
-
-    auto DiagOpts = std::make_shared<DiagnosticOptions>();
-    auto DiagPrinter = std::make_unique<TextDiagnosticPrinter>(llvm::errs(), DiagOpts.get());
+    auto DiagOpts = llvm::make_unique<DiagnosticOptions>();
+    auto DiagPrinter = llvm::make_unique<TextDiagnosticPrinter>(llvm::errs(), DiagOpts.get());
     IntrusiveRefCntPtr<DiagnosticsEngine> Diags(
         new DiagnosticsEngine(new DiagnosticIDs(), &*DiagOpts, DiagPrinter.release(), false));
 
-    auto Ctx = std::make_unique<LLVMContext>();
+    LLVMContext Context;
+    Context.setDiagnosticHandler(Diags);
+
+    auto targetOpts = std::make_shared<clang::TargetOptions>();
+    targetOpts->Triple = sys::getDefaultTargetTriple();
+
+    // In-memory file system for input
+    auto InMemFS = llvm::vfs::InMemoryFileSystem::create();
+    auto MB = llvm::MemoryBuffer::getMemBufferCopy(llvm::StringRef(c_src), "input.c");
+    InMemFS->addFile("input.c", /*modtime*/ 0, std::move(MB));
+    auto OverlayFS = std::make_shared<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
+    OverlayFS->pushOverlay(std::move(InMemFS));
 
     CompilerInstance CI;
     CI.createDiagnostics();
 
     auto Inv = std::make_shared<CompilerInvocation>();
     LangOptions& LO = Inv->getLangOpts();
-    LO.C11 = 1; LO.C99 = 1; LO.GNUMode = 1;
+    LO.C11 = 1;
+    LO.C99 = 1;
+    LO.GNUMode = 1;
 
-    auto TO = std::make_shared<TargetOptions>();
-    TO->Triple = sys::getDefaultTargetTriple();
-    Inv->setTargetOpts(*TO);
+    auto targetOpts = std::make_shared<clang::TargetOptions>();
+    targetOpts->Triple = sys::getDefaultTargetTriple();
+    Inv->setTargetOpts(*targetOpts);
 
     PreprocessorOptions& PP = Inv->getPreprocessorOpts();
-    for (auto& d : defines) PP.addMacroDef(d);
+    for (auto& d : cfg.defines) PP.addMacroDef(d);
     HeaderSearchOptions& HS = Inv->getHeaderSearchOpts();
     for (auto& p : incs) HS.AddPath(p, frontend::Angled, false, false);
 
     Inv->getFrontendOpts().Inputs.clear();
-    Inv->getFrontendOpts().ProgramAction = frontend::EmitLLVMOnly;
+    Inv->getFrontendOpts().ProgramAction = frontend::EmitObj;
     Inv->getFrontendOpts().Inputs.emplace_back("input.c", clang::Language::C);
 
     // Map source in-memory
-    auto InMemFS = llvm::vfs::InMemoryFileSystem::create();
-    auto MB = llvm::MemoryBuffer::getMemBufferCopy(StringRef(c_source), "input.c");
-    InMemFS->addFile("input.c", 0, std::move(MB));
-    auto OverlayFS = std::make_shared<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
-    OverlayFS->pushOverlay(std::move(InMemFS));
-
-    CI.setInvocation(std::move(Inv));
-    CI.createFileManager(OverlayFS);
-    CI.createSourceManager(CI.getFileManager());
-
     const clang::FileEntry* FE = CI.getFileManager().getFile("input.c");
     if (!FE) throw std::runtime_error("failed to map in-memory source as FileEntry");
     CI.getSourceManager().setMainFileID(CI.getSourceManager().createFileID(FE, clang::SourceLocation(), clang::SrcMgr::C_User));
+
     CI.createPreprocessor(clang::TU_Complete);
     CI.createASTContext();
 
-    clang::EmitLLVMOnlyAction Act(Ctx.get());
+    clang::EmitObjAction Act;
     if (!CI.ExecuteAction(Act))
-        throw std::runtime_error("clang IR generation failed");
+        throw std::runtime_error("clang in-proc codegen failed");
 
+    // Grab the produced object as a MemoryBuffer
 #if CLANG_VERSION_MAJOR >= 15
-    std::unique_ptr<llvm::Module> M = Act.takeModule();
+    std::unique_ptr<llvm::MemoryBuffer> Obj = Act.takeGeneratedObject();
 #else
-    std::unique_ptr<llvm::Module> M = Act.takeLLVMModule();
+    std::unique_ptr<llvm::MemoryBuffer> Obj = Act.takeOutputFile(); // older
 #endif
-    if (!M) throw std::runtime_error("no LLVM module produced");
+    if (!Obj) throw std::runtime_error("no object produced by clang action");
 
-    return { std::move(M), std::move(Ctx) };
+    // Linker set up
+    static llvm::sys::Mutex LinkerMutex;
+    llvm::sys::MutexGuard guard(LinkerMutex);
+
+    int rc = cs_link_with_lld(cfg, Obj->getMemBufferRef(), outPath);
+    return rc;
 }
-
-// ---- IR-level profiling pass (new pass manager)
-struct CSProfilePass : llvm::PassInfoMixin<CSProfilePass> {
-    llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
-        using namespace llvm;
-        LLVMContext& C = M.getContext();
-
-        // Declare (or get) void cs_prof_hit(i8*)
-        FunctionCallee Hit = M.getOrInsertFunction(
-            "cs_prof_hit",
-            FunctionType::get(Type::getVoidTy(C), { Type::getInt8PtrTy(C) }, false));
-
-        for (Function& F : M) {
-            if (F.isDeclaration()) continue;
-            if (F.getName().startswith("llvm.")) continue;
-
-            BasicBlock& Entry = F.getEntryBlock();
-            IRBuilder<> B(&*Entry.getFirstInsertionPt());
-
-            Value* Name = B.CreateGlobalStringPtr(F.getName(), "cs_fn_name");
-            B.CreateCall(Hit, { Name });
-        }
-
-        return PreservedAnalyses::none();
-    }
-};
 
 // ---- Utility: run our pass + a standard O-level pipeline before codegen
 static void cs_run_ir_pipeline(llvm::Module& M, int optLevel) {
@@ -1562,6 +1462,7 @@ static int cs_build_once_embed_profile_irpass(const Config& cfg,
 
         auto ObjBuf = cs_emit_obj_from_module(*Mod, cfg);
 
+
         int rc = cs_link_with_lld(cfg, ObjBuf->getMemBufferRef(), outTmpExecutable);
         return rc;
     }
@@ -1580,3 +1481,4 @@ static int cs_build_once_embed_profile_irpass(const Config& cfg,
 
 #endif // CS_EMBED_LLVM && CS_PGO_EMBED
 
+    
