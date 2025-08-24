@@ -334,6 +334,22 @@ static void cs_prof_hit(const char*){ /* no-op in optimized pass */ }
 #define try(result) do { if (!(result).ok) return Err((result).error); } while(0)
 )";
 
+    // Add to the prelude function
+    o << "// ---- Capsule safety system ----\n"
+      << "#ifdef CAPSULE_GUARD\n"
+      << "  static volatile unsigned long long cs__mutations = 0;\n"
+      << "  #define CS_MUT_NOTE()          do { cs__mutations++; } while(0)\n"
+      << "  #define CS_MUT_STORE(dst,val)  do { (dst)=(val); cs__mutations++; } while(0)\n"
+      << "  #define CS_MUT_MEMCPY(d,s,n)   do { memcpy((d),(s),(n)); cs__mutations++; } while(0)\n"
+      << "  #define CS_GLYPH(sym)          \"[\" sym \"]\" \n"
+      << "  static unsigned long long cs_mutation_count(void) { return cs__mutations; }\n"
+      << "#else\n"
+      << "  #define CS_MUT_NOTE()          do { } while(0)\n"
+      << "  #define CS_MUT_STORE(dst,val)  do { (dst)=(val); } while(0)\n"
+      << "  #define CS_MUT_MEMCPY(d,s,n)   memcpy((d),(s),(n))\n"
+      << "  #define CS_GLYPH(sym)          \"\"\n"
+      << "#endif\n\n";
+
     return o.str();
 }
 
@@ -419,7 +435,7 @@ static string lower_enum_bang_and_collect(const string& in, map<string, EnumInfo
     string s = in;
     // Match standard enum! and enum_flags!
     std::regex re_standard(R"(enum!\s+([A-Za-z_]\w*)\s*\{([^}]*)\})");
-    std::regex re_flags(R"(enum_flags!\s+([A-Za-z_]\w*)\s*\{([^}]*)\})");
+    std::regex re_flags(R"(enum_flags!\s+([A-ZaZ_]\w*)\s*\{([^}]*)\})");
     
     cmatch m;
     string out; 
@@ -827,7 +843,9 @@ int main(int argc, char** argv) {
                   << "  --verbose       Verbose output\n"
                   << "  --cc <compiler> Specify C compiler\n"
                   << "  --debug         Include debug information\n"
-                  << "  --target <triple> Set compilation target\n";
+                  << "  --target <triple> Set compilation target\n"
+                  << "  --capsule       Generate capsule.h and enable runtime safety\n"
+                  << "  --trace-lib     Trace library calls with symbolic overlays\n";
         return 1;
     }
 
@@ -849,6 +867,8 @@ int main(int argc, char** argv) {
             else if (a == "--cc" && i + 1 < args.size()) { cfg.cc_prefer = args[++i]; }
             else if (a == "--target" && i + 1 < args.size()) { cfg.target = args[++i]; }
             else if (a == "--warn-as-error") { cfg.warn_as_error = true; }
+            else if (a == "--capsule") { cfg.defines.push_back("CS_CAPSULE=1"); }
+            else if (a == "--trace-lib") { cfg.defines.push_back("CS_TRACE_LIB=1"); }
             else if (!a.empty() && a[0] != '-') { inpath = a; }
         }
         if (inpath.empty()) { throw CompilerError("Missing input .csc file"); }
@@ -1328,9 +1348,9 @@ static int build_once_llvm_inproc(const Config& cfg,
     LO.C99 = 1;
     LO.GNUMode = 1;
 
-    auto targetOpts = std::make_shared<clang::TargetOptions>();
-    targetOpts->Triple = sys::getDefaultTargetTriple();
-    Inv->setTargetOpts(*targetOpts);
+    auto targetOpts2 = std::make_shared<TargetOptions>();
+    targetOpts2->Triple = sys::getDefaultTargetTriple();
+    Inv->setTargetOpts(*targetOpts2);
 
     PreprocessorOptions& PP = Inv->getPreprocessorOpts();
     for (auto& d : cfg.defines) PP.addMacroDef(d);
@@ -1480,5 +1500,3 @@ static int cs_build_once_embed_profile_irpass(const Config& cfg,
 // Final pass already uses embedded path via CS_BUILD_ONCE_FINAL defined earlier
 
 #endif // CS_EMBED_LLVM && CS_PGO_EMBED
-
-    
