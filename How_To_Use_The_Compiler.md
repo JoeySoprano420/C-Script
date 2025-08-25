@@ -1,6 +1,3 @@
-I see you uploaded **`cscriptc.exe`** — that’s a compiled executable of your C-Script compiler (likely the binary output from your `cscriptc.cpp` source).
-
-A quick breakdown of what this file is and what it means:
 
 ---
 
