@@ -1253,3 +1253,22 @@ C-Script is “directive-first C with dual posture, single-artifact build, and b
 The above is synthesized directly from the project README and its “Monolith” sections (language model, grammar, directives, mapping, diagnostics, CLI, and examples). Where behavior is compiler/driver-specific (profiling rebuilds, inline linker), we followed the repo’s descriptions. ([GitHub][1])
 
 
+⚠️ Common Setup Issues
+Here are the most frequent hiccups when setting up C-Script:
+
+🔧 LLVM/Clang Linking Problems
+Missing LLVM dev packages: You need full LLVM + Clang + LLD development libraries installed.
+
+Incorrect llvm-config path: If you have multiple LLVM versions, make sure you're using the one that matches your linked libraries.
+
+Static vs dynamic linking: Some systems default to static builds, which can cause bloated binaries or linker errors.
+
+🧱 Windows-Specific Quirks
+MSVC regex quirks require patching or using Clang/MSYS2 instead.
+
+Path separators (\\ vs /) can break temp file generation.
+
+🧠 Compiler Flags
+If you forget -DCS_EMBED_LLVM=1, it’ll try to use a system compiler instead of in-process LLVM.
+
+Some flags like --capsule or --profile require matching directives in the .csc file.
