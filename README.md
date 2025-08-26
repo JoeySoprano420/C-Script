@@ -1272,3 +1272,63 @@ Path separators (\\ vs /) can break temp file generation.
 If you forget -DCS_EMBED_LLVM=1, it’ll try to use a system compiler instead of in-process LLVM.
 
 Some flags like --capsule or --profile require matching directives in the .csc file.
+
+🔁 Mutation-Aware AST Every AST node now carries embedded lineage glyphs (GLYPH_SOFTLINE_SUGAR, GLYPH_TEMPLATE_EXPANSION, etc.), enabling symbolic tracing from surface syntax to lowered IR.
+
+🧬 Directive Resolution Pass Directives like @hardline, @opt, and @profile now annotate AST nodes with posture and build overlays, influencing IR emission and semantic enforcement.
+
+🔥 LLVM IR Emission with Metadata IR functions and instructions are tagged with:
+
+!lineage: ancestral glyphs
+
+!guardian: ritual overlays (e.g., enum_exhaustive)
+
+!posture: directive context
+
+🛠️ Zero-Toolchain Compilation External CC dropped. Full in-process IR build and link via embedded libLLVM + LLD. No .ll, .o, or .asm intermediates—just one .exe.
+
+🧿 Symbolic Debugger: csight
+🧠 Breakpoints Reveal Ritual Layers Each breakpoint shows:
+
+Runtime value
+
+Mutation lineage
+
+Directive posture
+
+Guardian glyphs
+
+Source → Lowered C → IR trace
+
+🔍 CLI Ritual Commands
+
+csight break, csight trace, csight lineage, csight ritual
+
+Live glyph stream during build and debug
+
+🎯 Guardian Confirmations Build pipeline now emits animated confirmations:
+
+enum! coverage
+
+@hardline enforcement
+
+CS_DEFER scope rituals
+
+Linkage and artifact glyphs
+
+📜 Language Spec Updates
+🧾 Expanded Grammar Mapping File Canonical C constructs now fully mapped to C-Script equivalents with embedded lineage annotations.
+
+🧬 Parser Spec Token stream, AST definitions, directive resolution, and mutation glyph embedding formalized.
+
+🔥 IR Ritual Model IR emission now respects symbolic overlays and directive posture, enabling future capsule-aware tracing.
+
+🧩 Misc Fixes & Enhancements
+🧱 Hardened prelude macros (print, defer, likely)
+
+🧪 Improved enum exhaustiveness diagnostics
+
+🧠 Refined softline lowering for fn, let, var, and template
+
+🧿 Added @pack, @abi, and @target directive support
+
