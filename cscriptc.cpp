@@ -1640,160 +1640,161 @@ cycle, especially for trivial syntax errors.
 // ============================================================================
 
 namespace advanced_compiler {
-// Fix: Add missing closing brace for namespace advanced_compiler
+    // Fix: Add missing closing brace for namespace advanced_compiler
 } // end of namespace advanced_compiler
     // Configuration for advanced features
-    struct AdvancedConfig {
-        bool predictive_enabled = true;       // Code prediction based on patterns
-        bool zero_cost_correction = true;     // Enhanced error correction
-        bool capsule_gating = false;          // Strict capsule boundary enforcement
-        bool symbolic_feedback = true;        // Use symbols in CLI output
-        int inference_level = 3;              // 1-5, higher = more aggressive inference
-        bool track_patterns = true;           // Record successful code patterns
-    };
+struct AdvancedConfig {
+    bool predictive_enabled = true;       // Code prediction based on patterns
+    bool zero_cost_correction = true;     // Enhanced error correction
+    bool capsule_gating = false;          // Strict capsule boundary enforcement
+    bool symbolic_feedback = true;        // Use symbols in CLI output
+    int inference_level = 3;              // 1-5, higher = more aggressive inference
+    bool track_patterns = true;           // Record successful code patterns
+};
 
-    // Global pattern database for successful compilations
-    struct PatternDatabase {
-        std::map<string, int> successful_patterns;
-        std::map<string, std::vector<string>> correction_patterns;
-        std::map<string, double> pattern_weights;
-        bool initialized = false;
-    };
+// Global pattern database for successful compilations
+struct PatternDatabase {
+    std::map<string, int> successful_patterns;
+    std::map<string, std::vector<string>> correction_patterns;
+    std::map<string, double> pattern_weights;
+    bool initialized = false;
+};
 
-    static PatternDatabase pattern_db;
-    static AdvancedConfig advanced_cfg;
+static PatternDatabase pattern_db;
+static AdvancedConfig advanced_cfg;
 
-    // Initialize the pattern database from prior compilations if available
-    static void initialize_pattern_db() {
-        if (pattern_db.initialized) return;
-        
-        // Try to load patterns from cache file
-        std::string cache_path = get_temp_dir() + "cscript_patterns.cache";
-        std::ifstream cache(cache_path);
-        
-        if (cache) {
-            std::string line;
-            while (std::getline(cache, line)) {
-                auto parts = split(line, '|');
-                if (parts.size() >= 2) {
-                    pattern_db.successful_patterns[parts[0]] = std::stoi(parts[1]);
-                }
-            }
-        }
-        
-        // Initialize with some known good patterns if database is empty
-        if (pattern_db.successful_patterns.empty()) {
-            // Common code patterns with their weights
-            pattern_db.successful_patterns["fn_return"] = 100;
-            pattern_db.successful_patterns["if_condition"] = 90;
-            pattern_db.successful_patterns["for_loop"] = 85;
-            pattern_db.successful_patterns["enum_switch"] = 95;
-            
-            // Correction patterns for common errors
-            pattern_db.correction_patterns["missing_semicolon"] = 
-                {"^\\s*\\w+\\s+\\w+\\s*=\\s*[^;]+$", "^\\s*return\\s+[^;]+$"};
-            pattern_db.correction_patterns["unbalanced_braces"] = 
-                {"\\{([^{}]|\\{[^{}]*\\})*$"};
-            pattern_db.correction_patterns["missing_parenthesis"] = 
-                {"\\([^()]*$", "if\\s*\\([^()]*$"};
-        }
-        
-        pattern_db.initialized = true;
-    }
+// Initialize the pattern database from prior compilations if available
+static void initialize_pattern_db() {
+    if (pattern_db.initialized) return;
 
-    // Save the pattern database with updated weights
-    static void save_pattern_db() {
-        if (!pattern_db.initialized || !advanced_cfg.track_patterns) return;
-        
-        std::string cache_path = get_temp_dir() + "cscript_patterns.cache";
-        std::ofstream cache(cache_path);
-        
-        if (cache) {
-            for (const auto& pattern : pattern_db.successful_patterns) {
-                cache << pattern.first << "|" << pattern.second << "\n";
+    // Try to load patterns from cache file
+    std::string cache_path = get_temp_dir() + "cscript_patterns.cache";
+    std::ifstream cache(cache_path);
+
+    if (cache) {
+        std::string line;
+        while (std::getline(cache, line)) {
+            auto parts = split(line, '|');
+            if (parts.size() >= 2) {
+                pattern_db.successful_patterns[parts[0]] = std::stoi(parts[1]);
             }
         }
     }
 
-    // Calculate pattern match score for a given code fragment
-    static double calculate_pattern_score(const string& code_fragment) {
-        if (!pattern_db.initialized) initialize_pattern_db();
-        
-        double score = 0.0;
-        
+    // Initialize with some known good patterns if database is empty
+    if (pattern_db.successful_patterns.empty()) {
+        // Common code patterns with their weights
+        pattern_db.successful_patterns["fn_return"] = 100;
+        pattern_db.successful_patterns["if_condition"] = 90;
+        pattern_db.successful_patterns["for_loop"] = 85;
+        pattern_db.successful_patterns["enum_switch"] = 95;
+
+        // Correction patterns for common errors
+        pattern_db.correction_patterns["missing_semicolon"] =
+        { "^\\s*\\w+\\s+\\w+\\s*=\\s*[^;]+$", "^\\s*return\\s+[^;]+$" };
+        pattern_db.correction_patterns["unbalanced_braces"] =
+        { "\\{([^{}]|\\{[^{}]*\\})*$" };
+        pattern_db.correction_patterns["missing_parenthesis"] =
+        { "\\([^()]*$", "if\\s*\\([^()]*$" };
+    }
+
+    pattern_db.initialized = true;
+}
+
+// Save the pattern database with updated weights
+static void save_pattern_db() {
+    if (!pattern_db.initialized || !advanced_cfg.track_patterns) return;
+
+    std::string cache_path = get_temp_dir() + "cscript_patterns.cache";
+    std::ofstream cache(cache_path);
+
+    if (cache) {
         for (const auto& pattern : pattern_db.successful_patterns) {
-            if (code_fragment.find(pattern.first) != string::npos) {
-                score += pattern.second;
-            }
+            cache << pattern.first << "|" << pattern.second << "\n";
         }
-        
-        return score;
+    }
+}
+
+// Calculate pattern match score for a given code fragment
+static double calculate_pattern_score(const string& code_fragment) {
+    if (!pattern_db.initialized) initialize_pattern_db();
+
+    double score = 0.0;
+
+    for (const auto& pattern : pattern_db.successful_patterns) {
+        if (code_fragment.find(pattern.first) != string::npos) {
+            score += pattern.second;
+        }
     }
 
-    // Predictive programming for code completion and error correction
-    static string predict_code_completion(const string& incomplete_code, const map<string, EnumInfo>& enums) {
-        initialize_pattern_db();
+    return score;
+}
 
-        string result = incomplete_code;
+// Predictive programming for code completion and error correction
+static string predict_code_completion(const string& incomplete_code, const map<string, EnumInfo>& enums) {
+    initialize_pattern_db();
 
-        // Apply pattern-based predictions
-        for (const auto& pattern_set : pattern_db.correction_patterns) {
-            for (const auto& regex_pattern : pattern_set.second) {
-                std::regex pattern(regex_pattern);
-                std::smatch match;
+    string result = incomplete_code;
 
-                string::const_iterator search_start = result.cbegin();
-                while (std::regex_search(search_start, result.cend(), match, pattern)) {
-                    if (pattern_set.first == "missing_semicolon") {
-                        size_t pos = static_cast<size_t>(match.position() + match.length());
-                        size_t line_end = result.find('\n', pos);
-                        if (line_end != string::npos && line_end > 0 && result[line_end - 1] != ';') {
-                            result.insert(line_end, ";");
-                        }
-                    } else if (pattern_set.first == "unbalanced_braces") {
-                        int open_count = 0, close_count = 0;
-                        for (char c : result) {
-                            if (c == '{') open_count++;
-                            else if (c == '}') close_count++;
-                        }
-                        while (open_count > close_count) {
-                            result += "\n}";
-                            close_count++;
-                        }
+    // Apply pattern-based predictions
+    for (const auto& pattern_set : pattern_db.correction_patterns) {
+        for (const auto& regex_pattern : pattern_set.second) {
+            std::regex pattern(regex_pattern);
+            std::smatch match;
+
+            string::const_iterator search_start = result.cbegin();
+            while (std::regex_search(search_start, result.cend(), match, pattern)) {
+                if (pattern_set.first == "missing_semicolon") {
+                    size_t pos = static_cast<size_t>(match.position() + match.length());
+                    size_t line_end = result.find('\n', pos);
+                    if (line_end != string::npos && line_end > 0 && result[line_end - 1] != ';') {
+                        result.insert(line_end, ";");
                     }
-                    search_start = match.suffix().first;
                 }
+                else if (pattern_set.first == "unbalanced_braces") {
+                    int open_count = 0, close_count = 0;
+                    for (char c : result) {
+                        if (c == '{') open_count++;
+                        else if (c == '}') close_count++;
+                    }
+                    while (open_count > close_count) {
+                        result += "\n}";
+                        close_count++;
+                    }
+                }
+                search_start = match.suffix().first;
             }
         }
-
-        // Enhanced enum value prediction
-        for (const auto& e : enums) {
-            std::regex enum_usage(e.first + R"(::(\w+))");
-            std::smatch m;
-
-            std::string::const_iterator search_start = result.cbegin();
-            while (std::regex_search(search_start, result.cend(), m, enum_usage)) {
-                std::string enum_value = m[1].str();
-
-                // Build the fully qualified token that matched, e.g. "Color::Red"
-                const std::string matched_token = m.str(0);
-
-                // Absolute position and length of the matched token in 'result'
-                const size_t abs_begin = static_cast<size_t>(std::distance(result.cbegin(), m[0].first));
-                const size_t abs_end   = static_cast<size_t>(std::distance(result.cbegin(), m[0].second));
-                const size_t token_len = abs_end - abs_begin;
-
-                const std::string fq_token = e.first + std::string("::") + enum_value;
-
-                // ... your validation/replacement logic ...
-
-                // Advance past the current match
-                search_start = m.suffix().first;
-            }
-        }
-
-        return result;
     }
+
+    // Enhanced enum value prediction
+    for (const auto& e : enums) {
+        std::regex enum_usage(e.first + R"(::(\w+))");
+        std::smatch m;
+
+        std::string::const_iterator search_start = result.cbegin();
+        while (std::regex_search(search_start, result.cend(), m, enum_usage)) {
+            std::string enum_value = m[1].str();
+
+            // Build the fully qualified token that matched, e.g. "Color::Red"
+            const std::string matched_token = m.str(0);
+
+            // Absolute position and length of the matched token in 'result'
+            const size_t abs_begin = static_cast<size_t>(std::distance(result.cbegin(), m[0].first));
+            const size_t abs_end = static_cast<size_t>(std::distance(result.cbegin(), m[0].second));
+            const size_t token_len = abs_end - abs_begin;
+
+            const std::string fq_token = e.first + std::string("::") + enum_value;
+
+            // ... your validation/replacement logic ...
+
+            // Advance past the current match
+            search_start = m.suffix().first;
+        }
+    }
+
+    return result;
+}
 
 // ============================================================================
 // ==============  Build Auto-Fix Shim (compiler+linker tandem) ===============
@@ -1821,7 +1822,7 @@ namespace build_autofix {
         auto rtrim = [](std::string s) {
             while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
             return s;
-        };
+            };
 
         size_t openBr = 0, closeBr = 0;
         while (std::getline(in, line)) {
@@ -1832,7 +1833,8 @@ namespace build_autofix {
 
             if (!stripped.empty() && stripped[0] == '#') {
                 out += raw + "\n";
-            } else {
+            }
+            else {
                 for (char c : stripped) {
                     if (c == '{') ++openBr;
                     else if (c == '}') ++closeBr;
@@ -1841,12 +1843,12 @@ namespace build_autofix {
                 bool endsWithSemi = !stripped.empty() && stripped.back() == ';';
                 bool looksStmt =
                     (!stripped.empty() &&
-                     stripped.rfind("if", 0) == 0 ? false :
-                     stripped.rfind("for", 0) == 0 ? false :
-                     stripped.rfind("while", 0) == 0 ? false :
-                     stripped.rfind("switch", 0) == 0 ? false :
-                     stripped.back() == ')' || stripped.find('=') != std::string::npos ||
-                     stripped.rfind("return", 0) == 0);
+                        stripped.rfind("if", 0) == 0 ? false :
+                        stripped.rfind("for", 0) == 0 ? false :
+                        stripped.rfind("while", 0) == 0 ? false :
+                        stripped.rfind("switch", 0) == 0 ? false :
+                        stripped.back() == ')' || stripped.find('=') != std::string::npos ||
+                        stripped.rfind("return", 0) == 0);
                 if (!endsWithBrace && !endsWithSemi && looksStmt) out += raw + ";\n";
                 else out += raw + "\n";
             }
@@ -1865,12 +1867,12 @@ namespace build_autofix {
     }
 
     static int compile_attempt(const Config& cfg,
-                               const std::string& cc,
-                               const std::string& c_src,
-                               const std::string& out,
-                               bool defineProfile,
-                               const char* note,
-                               int mutKind /*0=none,1=encode,2=addlm*/) {
+        const std::string& cc,
+        const std::string& c_src,
+        const std::string& out,
+        bool defineProfile,
+        const char* note,
+        int mutKind /*0=none,1=encode,2=addlm*/) {
         std::string cpath = write_temp(std::string("cscript_") + std::to_string(uintptr_t(&cfg)) + ".c", c_src);
         std::string cmd = build_cmd(const_cast<Config&>(cfg), cc, cpath, out, defineProfile);
 
@@ -1880,7 +1882,8 @@ namespace build_autofix {
                 cmd = inject_flag(cmd, "-finput-charset=UTF-8");
                 cmd = inject_flag(cmd, "-fexec-charset=UTF-8");
             }
-        } else if (mutKind == 2) {
+        }
+        else if (mutKind == 2) {
 #if !defined(_WIN32)
             cmd = ensure_link_lib(cmd, "-lm");
 #endif
@@ -1893,10 +1896,10 @@ namespace build_autofix {
     }
 
     static int run_cmd_with_attempts(const Config& cfg,
-                                     const std::string& cc,
-                                     const std::string& c_src,
-                                     const std::string& out,
-                                     bool defineProfile) {
+        const std::string& cc,
+        const std::string& c_src,
+        const std::string& out,
+        bool defineProfile) {
         if (compile_attempt(cfg, cc, c_src, out, defineProfile, "Attempt 1: vanilla build", 0) == 0) return 0;
         if (compile_attempt(cfg, cc, c_src, out, defineProfile, "Attempt 2: add UTF-8 encoding flags", 1) == 0) return 0;
         if (compile_attempt(cfg, cc, c_src, out, defineProfile, "Attempt 3: ensure -lm (POSIX)", 2) == 0) return 0;
@@ -1913,10 +1916,10 @@ namespace build_autofix {
 
 // Public shim to replace build_once(...) calls in main()
 static int build_once_autofix(const Config& cfg,
-                              const std::string& cc,
-                              const std::string& c_src,
-                              const std::string& out,
-                              bool defineProfile) {
+    const std::string& cc,
+    const std::string& c_src,
+    const std::string& out,
+    bool defineProfile) {
     if (cfg.show_c) {
         std::cerr << "--- Generated C (pre-auto-fix) ---\n" << c_src << "\n--- End ---\n";
     }
