@@ -1,4 +1,4 @@
-// cscriptc.cpp — C-Script v0.4.1.1 reference compiler (front + analyzer + PGO + driver)
+// cscriptc.cpp — C-Script v0.4 reference compiler (front + analyzer + PGO + driver)
 // Build: g++ -std=gnu++17 cscriptc.cpp -o cscriptc      (Linux/macOS, Clang/GCC)
 //     or clang++ -std=c++17 cscriptc.cpp -o cscriptc
 //     or (MSYS/Clang on Windows recommended). MSVC works but needs regex fixes below.
@@ -1640,6 +1640,8 @@ cycle, especially for trivial syntax errors.
 // ============================================================================
 
 namespace advanced_compiler {
+// Fix: Add missing closing brace for namespace advanced_compiler
+} // end of namespace advanced_compiler
     // Configuration for advanced features
     struct AdvancedConfig {
         bool predictive_enabled = true;       // Code prediction based on patterns
